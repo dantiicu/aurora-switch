@@ -3,6 +3,9 @@
 #ifdef AURORA_ENABLE_GX
 #include "gfx/common.hpp"
 #include "gx/fifo.hpp"
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+#include "vulkan/gpu.hpp"
+#endif
 #include "webgpu/gpu.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
@@ -33,6 +36,10 @@ char g_gameName[4];
 
 namespace {
 Module Log("aurora");
+#if defined(AURORA_USE_DIRECT_VULKAN_GX)
+uint32_t g_directTraceFrame = 0;
+constexpr bool DirectVkFrameTrace = false;
+#endif
 
 #if defined(__SWITCH__)
 const char* SDL_GetError() {
@@ -170,6 +177,16 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   /* Attempt to create a window using the calling application's desired backend */
   AuroraBackend selectedBackend = config.desiredBackend;
   bool windowCreated = false;
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  selectedBackend = BACKEND_VULKAN;
+  if (window::create_window(selectedBackend)) {
+    if (vk::initialize(g_config.vsync)) {
+      windowCreated = true;
+    } else {
+      window::destroy_window();
+    }
+  }
+#else
   if (selectedBackend != BACKEND_AUTO && window::create_window(selectedBackend)) {
     if (webgpu::initialize(selectedBackend)) {
       windowCreated = true;
@@ -192,13 +209,16 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
       }
     }
   }
+#endif
 
   ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
 
+#ifndef AURORA_USE_DIRECT_VULKAN_GX
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
   if (webgpu::g_backendType == wgpu::BackendType::Null) {
     ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
+#endif
 #else
   AuroraBackend selectedBackend = BACKEND_NULL;
   ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
@@ -224,7 +244,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 #endif
 
 #ifdef AURORA_ENABLE_RMLUI
+#ifndef AURORA_USE_DIRECT_VULKAN_GX
   rmlui::initialize(size);
+#endif
 #endif
 
   g_initialFrame = true;
@@ -243,7 +265,9 @@ wgpu::TextureView g_currentView;
 
 void shutdown() noexcept {
 #ifdef AURORA_ENABLE_RMLUI
+#ifndef AURORA_USE_DIRECT_VULKAN_GX
   rmlui::shutdown();
+#endif
 #endif
 #ifdef AURORA_ENABLE_GX
   g_currentView = {};
@@ -251,7 +275,11 @@ void shutdown() noexcept {
   imgui::shutdown();
 #endif
   gfx::shutdown();
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  vk::shutdown();
+#else
   webgpu::shutdown();
+#endif
 #endif
   input::shutdown();
   window::shutdown();
@@ -269,6 +297,34 @@ const AuroraEvent* update() noexcept {
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  {
+    window::SurfaceLock surfaceLock;
+    if (!window::is_presentable() || window::is_paused()) {
+      return false;
+    }
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} vk begin_frame begin", g_directTraceFrame);
+    }
+    if (!vk::begin_frame({0.f, 0.f, 0.f, 1.f}, false)) {
+      return false;
+    }
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} vk begin_frame done", g_directTraceFrame);
+    }
+  }
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} gfx begin_frame begin", g_directTraceFrame);
+  }
+  if (!gfx::begin_frame()) {
+    vk::end_frame();
+    return false;
+  }
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} gfx begin_frame done", g_directTraceFrame);
+  }
+  return true;
+#else
   {
     window::SurfaceLock surfaceLock;
     if (!window::is_presentable()) {
@@ -319,12 +375,54 @@ bool begin_frame() noexcept {
     return false;
   }
 #endif
+#endif
   return true;
 }
 
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} fifo drain begin", g_directTraceFrame);
+  }
+  gx::fifo::drain();
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} fifo drain done", g_directTraceFrame);
+  }
+  const auto& frame = vk::current_frame();
+  if (frame.commandBuffer != VK_NULL_HANDLE) {
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} gfx end_frame begin", g_directTraceFrame);
+    }
+    gfx::end_frame(frame.commandBuffer);
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} gfx end_frame done", g_directTraceFrame);
+    }
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} gfx render begin", g_directTraceFrame);
+    }
+    gfx::render(frame.commandBuffer);
+    if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+      Log.info("[DirectVK] frame {} gfx render done", g_directTraceFrame);
+    }
+  }
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} vk end_frame begin", g_directTraceFrame);
+  }
+  vk::end_frame();
+  if (DirectVkFrameTrace && g_directTraceFrame < 4) {
+    Log.info("[DirectVK] frame {} vk end_frame done", g_directTraceFrame);
+  }
+  ++g_directTraceFrame;
+  TracyPlot("aurora: drawCallCount", static_cast<int64_t>(gfx::g_stats.drawCallCount));
+  TracyPlot("aurora: mergedDrawCallCount", static_cast<int64_t>(gfx::g_stats.mergedDrawCallCount));
+  TracyPlot("aurora: lastVertSize", static_cast<int64_t>(gfx::g_stats.lastVertSize));
+  TracyPlot("aurora: lastUniformSize", static_cast<int64_t>(gfx::g_stats.lastUniformSize));
+  TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(gfx::g_stats.lastIndexSize));
+  TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(gfx::g_stats.lastStorageSize));
+  return;
+#else
 #if defined(__SWITCH__)
   const auto profileStart = SwitchProfileClock::now();
   auto profileStepStart = profileStart;
@@ -491,6 +589,7 @@ void end_frame() noexcept {
   TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(gfx::g_stats.lastStorageSize));
   TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(gfx::g_stats.lastTextureUploadSize));
 
+#endif
 #endif
 }
 } // namespace

@@ -13,6 +13,9 @@
 #include <aurora/math.hpp>
 #include <dolphin/gx/GXEnum.h>
 #include <webgpu/webgpu_cpp.h>
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+#include <vulkan/vulkan.h>
+#endif
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
@@ -224,8 +227,14 @@ void shutdown();
 
 bool begin_frame();
 void end_frame(const wgpu::CommandEncoder& cmd);
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+void end_frame(VkCommandBuffer cmd);
+#endif
 uint32_t current_frame() noexcept;
 void render(wgpu::CommandEncoder& cmd);
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+void render(VkCommandBuffer cmd);
+#endif
 void render_pass(const wgpu::RenderPassEncoder& pass, uint32_t idx);
 void after_submit() noexcept;
 void map_staging_buffer();

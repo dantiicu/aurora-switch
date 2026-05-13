@@ -11,8 +11,12 @@
 #include <cstring>
 #include <bitset>
 #include <memory>
+#include <string>
 #include <array>
 #include <cfloat>
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+#include <vulkan/vulkan.h>
+#endif
 
 #define M_PIF 3.14159265358979323846f
 
@@ -459,6 +463,15 @@ struct PipelineConfig;
 
 struct GXBindGroups {
   gfx::BindGroupRef textureBindGroup;
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+  struct VkTextureBinding {
+    VkImageView imageView = VK_NULL_HANDLE;
+    u32 mode0 = 0;
+    u32 mode1 = 0;
+  };
+  VkTextureBinding vkTextures[MaxTextures]{};
+  uint32_t vkSampledTextureMask = 0;
+#endif
 };
 // Output info from shader generation
 struct ShaderInfo {
@@ -484,8 +497,14 @@ struct BindGroupRanges {
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept;
+std::string build_shader_source(const ShaderConfig& config) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+using VkTextureHandleArray = std::array<gfx::TextureHandle, MaxTextures>;
+const VkTextureHandleArray* direct_vulkan_texture_handles(gfx::BindGroupRef textureBindGroup) noexcept;
+void clear_direct_vulkan_texture_handles() noexcept;
+#endif
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;

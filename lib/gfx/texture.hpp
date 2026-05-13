@@ -4,6 +4,9 @@
 #include <utility>
 
 #include "common.hpp"
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+#include "../vulkan/resources.hpp"
+#endif
 
 namespace aurora::gfx {
 struct TextureUpload {
@@ -35,6 +38,13 @@ struct TextureRef {
   uint32_t mipCount;
   u32 gxFormat;
   bool hasArbitraryMips = false;
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+  VkImage vkImage = VK_NULL_HANDLE;
+  VkDeviceMemory vkMemory = VK_NULL_HANDLE;
+  VkImageView vkImageView = VK_NULL_HANDLE;
+  VkFormat vkFormat = VK_FORMAT_UNDEFINED;
+  VkImageLayout vkLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#endif
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
              wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
@@ -45,6 +55,7 @@ struct TextureRef {
   , format(format)
   , mipCount(mipCount)
   , gxFormat(gxFormat) {}
+  ~TextureRef();
 };
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,

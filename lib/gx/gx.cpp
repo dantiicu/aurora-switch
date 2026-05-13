@@ -78,6 +78,9 @@ struct TlutObjectCache {
 
 absl::flat_hash_map<u32, CachedTextureEntry> s_textureObjectCaches;
 absl::flat_hash_map<u32, TlutObjectCache> s_tlutObjectCaches;
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+absl::flat_hash_map<gfx::BindGroupRef, VkTextureHandleArray> s_directVkTextureHandles;
+#endif
 
 DynamicPaletteKey make_dynamic_palette_key(const GXTexObj_& obj, const GXState::CopyTextureRef& source) {
   return {
@@ -241,6 +244,18 @@ u32 resolved_format_for_handle(const gfx::TextureHandle& handle) {
   return GX_TF_RGBA8_PC;
 }
 } // namespace
+
+#ifdef AURORA_ENABLE_DIRECT_VULKAN
+const VkTextureHandleArray* direct_vulkan_texture_handles(gfx::BindGroupRef textureBindGroup) noexcept {
+  const auto it = s_directVkTextureHandles.find(textureBindGroup);
+  if (it == s_directVkTextureHandles.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+void clear_direct_vulkan_texture_handles() noexcept { s_directVkTextureHandles.clear(); }
+#endif
 
 Vec2<uint32_t> logical_fb_size() noexcept {
   return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
@@ -808,6 +823,59 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   ZoneScoped;
 
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
+    return {};
+  }
+
+  GXBindGroups out{};
+  VkTextureHandleArray textureHandles{};
+  HashType hash = xxh3_hash_s("GXVKTex", 7);
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const bool sampled = info.sampledTextures[i] || info.sampledIndTextures[i];
+    if (sampled) {
+      out.vkSampledTextureMask |= 1u << i;
+    }
+    if (!sampled) {
+      continue;
+    }
+
+    const auto& tex = g_gxState.textures[i];
+    textureHandles[i] = tex.ref;
+    out.vkTextures[i] = {
+        .imageView = textureHandles[i] ? textureHandles[i]->vkImageView : VK_NULL_HANDLE,
+        .mode0 = tex.texObj.mode0,
+        .mode1 = tex.texObj.mode1,
+    };
+    const struct {
+      uintptr_t handle;
+      u32 mode0;
+      u32 mode1;
+      u32 image0;
+      u32 image3;
+      u32 width;
+      u32 height;
+      u32 format;
+      u32 texDataVersion;
+      u8 flags;
+    } key{
+        .handle = reinterpret_cast<uintptr_t>(out.vkTextures[i].imageView),
+        .mode0 = tex.texObj.mode0,
+        .mode1 = tex.texObj.mode1,
+        .image0 = tex.texObj.image0,
+        .image3 = tex.texObj.image3,
+        .width = tex.texObj.width(),
+        .height = tex.texObj.height(),
+        .format = tex.texObj.format(),
+        .texDataVersion = tex.texObj.texDataVersion,
+        .flags = tex.texObj.flags,
+    };
+    hash = xxh3_hash_s(&key, sizeof(key), hash);
+  }
+  out.textureBindGroup = hash;
+  s_directVkTextureHandles[out.textureBindGroup] = std::move(textureHandles);
+  return out;
+#else
   if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
     // Don't bother re-binding anything
     return {};
@@ -838,10 +906,15 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   return {
       .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
   };
+#endif
 }
 
 void initialize() noexcept {
   Log.info("GX initialize begin");
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  Log.info("GX direct Vulkan initialize done");
+  return;
+#endif
   {
     Log.info("GX create texture bind group layout begin");
     std::array<wgpu::BindGroupLayoutEntry, MaxTextures * 2> textureEntries;

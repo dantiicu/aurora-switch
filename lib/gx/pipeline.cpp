@@ -10,11 +10,22 @@ static Module Log("aurora::gx");
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  (void)config;
+  Log.warn("Ignoring WebGPU GX pipeline creation on direct Vulkan GX path");
+  return {};
+#else
   const auto shader = build_shader(config.shaderConfig);
   return build_pipeline(config, {}, shader, "GX Pipeline");
+#endif
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  (void)data;
+  (void)pass;
+  return;
+#else
   if (!gfx::bind_pipeline(data.pipeline, pass)) {
     return;
   }
@@ -30,5 +41,6 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     pass.SetBlendConstant(&color);
   }
   pass.DrawIndexed(data.indexCount, data.instanceCount);
+#endif
 }
 } // namespace aurora::gx

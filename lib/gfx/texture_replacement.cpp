@@ -712,6 +712,10 @@ bool try_bind_replacement(GXTexObj_& obj, GXTexMapID id) noexcept {
 std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
   ZoneScoped;
 
+#ifdef AURORA_USE_DIRECT_VULKAN_GX
+  (void)obj;
+  return std::nullopt;
+#else
   if (!g_config.allowTextureReplacements) {
     return std::nullopt;
   }
@@ -738,5 +742,6 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
 
   cache_replacement(key, handle);
   return handle;
+#endif
 }
 } // namespace aurora::gfx::texture_replacement
