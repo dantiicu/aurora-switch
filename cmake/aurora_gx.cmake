@@ -2,13 +2,17 @@ add_library(aurora_gx STATIC
         lib/gfx/clear.cpp
         lib/gfx/common.cpp
         lib/gfx/depth_peek.cpp
+        lib/gfx/render_worker.cpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp
         lib/gfx/texture.cpp
+        lib/gfx/texture_format.cpp
         lib/gfx/texture_convert.cpp
         lib/gfx/texture_replacement.cpp
+        lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
+        lib/gx/dl.cpp
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
         lib/gx/pipeline.cpp
@@ -33,6 +37,8 @@ add_library(aurora_gx STATIC
         lib/dolphin/gx/GXTransform.cpp
         lib/dolphin/gx/GXVert.cpp
         lib/dolphin/gx/GXAurora.cpp
+        lib/gfx/png_io.cpp
+        lib/gfx/png_io.hpp
 )
 if (AURORA_ENABLE_GPU_CACHE)
     target_sources(aurora_gx PRIVATE lib/gfx/pipeline_cache.cpp)
@@ -42,9 +48,19 @@ endif ()
 add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
-target_link_libraries(aurora_gx PUBLIC aurora::core xxhash)
-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map dawn::webgpu_dawn TracyClient)
+target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxhash)
+target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map TracyClient)
 if (AURORA_ENABLE_GPU_CACHE)
     target_link_libraries(aurora_gx PRIVATE sqlite3)
 endif ()
+if (NOT AURORA_PLATFORM_SWITCH)
+    target_link_libraries(aurora_gx PRIVATE PNG::PNG)
+endif ()
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+
+if (AURORA_ENABLE_RMLUI)
+    target_sources(aurora_gx PRIVATE
+        lib/rmlui/pipeline.cpp
+        lib/rmlui/pipeline.hpp
+    )
+endif ()

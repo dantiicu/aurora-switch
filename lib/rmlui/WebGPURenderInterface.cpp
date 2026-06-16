@@ -1,6 +1,8 @@
 #include "WebGPURenderInterface.hpp"
 
 #include "FileInterface_SDL.h"
+#include "RuntimeTextureProvider.hpp"
+#include "pipeline.hpp"
 
 #include <RmlUi/Core/Core.h>
 #include <RmlUi/Core/DecorationTypes.h>
@@ -17,19 +19,20 @@
 #include <cstring>
 #include <limits>
 #include <string>
-#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
-#include "../internal.hpp"
-#include "../gfx/clear.hpp"
+#include "../gfx/texture.hpp"
 
 namespace aurora::rmlui {
 namespace {
 Module Log("aurora::rmlui::RenderInterface");
+
+constexpr size_t rmlBufferOffsetAlignment = 4;
+constexpr float FilterEpsilon = 0.0001f;
 
 struct Image {
   std::unique_ptr<uint8_t[]> data;
@@ -39,18 +42,38 @@ struct Image {
 };
 
 struct ShaderGeometryData {
-  wgpu::Buffer m_vertexBuffer;
-  wgpu::Buffer m_indexBuffer;
+  std::vector<Rml::Vertex> vertices;
+  std::vector<uint32_t> indices;
 };
 
 struct ShaderTextureData {
-  wgpu::BindGroup m_bindGroup;
   wgpu::Texture m_texture;
   wgpu::TextureView m_textureView;
+  std::vector<Rml::byte> m_pendingUpload;
+  wgpu::Extent3D m_size{};
+  uint32_t m_rowBytes = 0;
+  bool m_uploaded = false;
 };
 
 struct CompiledShaderData {
   GradientUniformBlock gradient;
+};
+
+enum class FilterType {
+  Opacity,
+  Blur,
+  DropShadow,
+  ColorMatrix,
+  MaskImage,
+};
+
+struct CompiledFilter {
+  FilterType type = FilterType::Blur;
+  float opacity = 1.f;
+  float sigma = 0.f;
+  Rml::Vector2f offset;
+  Rml::ColourbPremultiplied color;
+  Rml::Matrix4f colorMatrix;
 };
 
 Image get_image(const Rml::String& source) {
@@ -160,26 +183,6 @@ Image get_image(const Rml::String& source) {
 #endif
 }
 
-wgpu::Buffer create_mapped_buffer(const char* label, wgpu::BufferUsage usage, const void* data, size_t dataSize) {
-  const auto bufferSize = static_cast<uint64_t>(AURORA_ALIGN(std::max<size_t>(dataSize, 4), 4));
-  const wgpu::BufferDescriptor desc{
-      .label = label,
-      .usage = usage,
-      .size = bufferSize,
-      .mappedAtCreation = true,
-  };
-  wgpu::Buffer buffer = webgpu::g_device.CreateBuffer(&desc);
-  auto* dst = static_cast<uint8_t*>(buffer.GetMappedRange(0, bufferSize));
-  if (dst != nullptr) {
-    std::memcpy(dst, data, dataSize);
-    if (bufferSize > dataSize) {
-      std::memset(dst + dataSize, 0, static_cast<size_t>(bufferSize - dataSize));
-    }
-  }
-  buffer.Unmap();
-  return buffer;
-}
-
 void sigma_to_params(float desiredSigma, int& passLevel, float& sigma) {
   constexpr int MaxPasses = 10;
   constexpr float MaxSinglePassSigma = 3.f;
@@ -234,512 +237,188 @@ Rml::ColumnMajorMatrix4f to_shader_matrix(const Rml::Matrix4f& matrix) {
   }
 }
 
+bool is_identity_matrix(const Rml::Matrix4f& matrix) {
+  const Rml::Matrix4f identity = Rml::Matrix4f::Identity();
+  const auto* matrixData = matrix.data();
+  const auto* identityData = identity.data();
+  for (size_t i = 0; i < 16; ++i) {
+    if (std::abs(matrixData[i] - identityData[i]) > FilterEpsilon) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool is_identity_filter(const CompiledFilter& filter) {
+  switch (filter.type) {
+  case FilterType::Opacity:
+    return std::abs(filter.opacity - 1.f) <= FilterEpsilon;
+  case FilterType::Blur:
+    return filter.sigma < 0.5f;
+  case FilterType::ColorMatrix:
+    return is_identity_matrix(filter.colorMatrix);
+  case FilterType::DropShadow:
+  case FilterType::MaskImage:
+  default:
+    return false;
+  }
+}
+
+std::vector<Rml::CompiledFilterHandle> active_filters(Rml::Span<const Rml::CompiledFilterHandle> filters) {
+  std::vector<Rml::CompiledFilterHandle> activeFilters;
+  activeFilters.reserve(filters.size());
+  for (Rml::CompiledFilterHandle filterHandle : filters) {
+    const auto* filter = reinterpret_cast<const CompiledFilter*>(filterHandle);
+    if (filter != nullptr && !is_identity_filter(*filter)) {
+      activeFilters.push_back(filterHandle);
+    }
+  }
+  return activeFilters;
+}
+
+bool try_fold_simple_filters(Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Matrix4f& colorMatrix,
+                             float& opacity) {
+  colorMatrix = Rml::Matrix4f::Identity();
+  opacity = 1.f;
+
+  for (Rml::CompiledFilterHandle filterHandle : filters) {
+    const auto* filter = reinterpret_cast<const CompiledFilter*>(filterHandle);
+    if (filter == nullptr) {
+      continue;
+    }
+
+    switch (filter->type) {
+    case FilterType::Opacity:
+      opacity *= filter->opacity;
+      break;
+    case FilterType::ColorMatrix:
+      colorMatrix = filter->colorMatrix * colorMatrix;
+      break;
+    case FilterType::Blur:
+    case FilterType::DropShadow:
+    case FilterType::MaskImage:
+    default:
+      return false;
+    }
+  }
+
+  return true;
+}
+
 Rml::Rectanglei downsample_scissor(Rml::Rectanglei scissor) {
   scissor.p0 = (scissor.p0 + Rml::Vector2i(1)) / 2;
   scissor.p1 = Rml::Math::Max(scissor.p1 / 2, scissor.p0);
   return scissor;
 }
 
-void upload_texture_data(const wgpu::Texture& texture, const uint8_t* data, uint32_t width, uint32_t height) {
-  constexpr uint32_t BytesPerPixel = 4;
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
+PipelineConfig make_pipeline_config(PipelineKind kind, wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+                                    VertexLayoutKind vertexLayout, StencilMode stencilMode, BlendMode blendMode,
+                                    wgpu::ColorWriteMask colorWriteMask = wgpu::ColorWriteMask::All) {
+  return {
+      .kind = static_cast<uint32_t>(kind),
+      .colorFormat = static_cast<uint32_t>(colorFormat),
+      .sampleCount = sampleCount,
+      .vertexLayout = static_cast<uint32_t>(vertexLayout),
+      .stencilFormat = static_cast<uint32_t>(WebGPURenderInterface::ClipMaskStencilFormat),
+      .stencilMode = static_cast<uint32_t>(stencilMode),
+      .blendMode = static_cast<uint32_t>(blendMode),
+      .colorWriteMask = static_cast<uint32_t>(colorWriteMask),
   };
+}
 
-#ifdef AURORA_PLATFORM_SWITCH
-  const uint32_t bytesPerRow = width * BytesPerPixel;
-  const uint32_t copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
-  const uint64_t uploadSize = static_cast<uint64_t>(copyBytesPerRow) * height;
-  const wgpu::BufferDescriptor uploadDesc{
-      .label = "RmlUi Texture Upload Buffer",
-      .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
-      .size = uploadSize,
-      .mappedAtCreation = true,
-  };
-  wgpu::Buffer uploadBuffer = webgpu::g_device.CreateBuffer(&uploadDesc);
-  auto* dst = static_cast<uint8_t*>(uploadBuffer.GetMappedRange(0, uploadSize));
-  for (uint32_t row = 0; row < height; ++row) {
-    std::memcpy(dst + static_cast<size_t>(row) * copyBytesPerRow,
-                data + static_cast<size_t>(row) * bytesPerRow, bytesPerRow);
+gfx::PipelineRef geometry_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+                                   WebGPURenderInterface::PipelineType type) {
+  StencilMode stencilMode = StencilMode::AlwaysKeep;
+  auto colorWriteMask = wgpu::ColorWriteMask::All;
+  switch (type) {
+  case WebGPURenderInterface::PipelineType::Masked:
+    stencilMode = StencilMode::EqualKeep;
+    break;
+  case WebGPURenderInterface::PipelineType::ClipReplace:
+    stencilMode = StencilMode::ClipReplace;
+    colorWriteMask = wgpu::ColorWriteMask::None;
+    break;
+  case WebGPURenderInterface::PipelineType::ClipIntersect:
+    stencilMode = StencilMode::ClipIntersect;
+    colorWriteMask = wgpu::ColorWriteMask::None;
+    break;
+  case WebGPURenderInterface::PipelineType::Normal:
+  case WebGPURenderInterface::PipelineType::Count:
+  default:
+    break;
   }
-  uploadBuffer.Unmap();
+  return gfx::pipeline_ref(make_pipeline_config(PipelineKind::Geometry, colorFormat, sampleCount,
+                                                VertexLayoutKind::Geometry, stencilMode, BlendMode::Premultiplied,
+                                                colorWriteMask));
+}
 
-  const wgpu::TexelCopyBufferInfo src{
-      .layout =
-          {
-              .offset = 0,
-              .bytesPerRow = copyBytesPerRow,
-              .rowsPerImage = height,
-          },
-      .buffer = uploadBuffer,
-  };
-  const wgpu::TexelCopyTextureInfo dstTexture{
-      .texture = texture,
-      .aspect = wgpu::TextureAspect::All,
-  };
-  const wgpu::CommandEncoderDescriptor encoderDesc{
-      .label = "RmlUi Texture Upload Encoder",
-  };
-  wgpu::CommandEncoder encoder = webgpu::g_device.CreateCommandEncoder(&encoderDesc);
-  encoder.CopyBufferToTexture(&src, &dstTexture, &size);
-  const wgpu::CommandBufferDescriptor cmdDesc{
-      .label = "RmlUi Texture Upload",
-  };
-  const wgpu::CommandBuffer cmd = encoder.Finish(&cmdDesc);
-  webgpu::g_queue.Submit(1, &cmd);
-#else
+gfx::PipelineRef gradient_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool masked) {
+  return gfx::pipeline_ref(
+      make_pipeline_config(PipelineKind::Gradient, colorFormat, sampleCount, VertexLayoutKind::Geometry,
+                           masked ? StencilMode::EqualKeep : StencilMode::AlwaysKeep, BlendMode::Premultiplied));
+}
+
+gfx::PipelineRef blit_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+                               WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
+  const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
+                     type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
+  const bool masked = type == WebGPURenderInterface::BlitPipelineType::BlendMasked ||
+                      type == WebGPURenderInterface::BlitPipelineType::ReplaceMasked;
+  return gfx::pipeline_ref(
+      make_pipeline_config(PipelineKind::Blit, colorFormat, sampleCount, VertexLayoutKind::Fullscreen,
+                           masked ? StencilMode::EqualKeep : (useStencil ? StencilMode::AlwaysKeep : StencilMode::None),
+                           blend ? BlendMode::Premultiplied : BlendMode::None));
+}
+
+gfx::PipelineRef simple_filter_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+                                        WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
+  const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
+                     type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
+  const bool masked = type == WebGPURenderInterface::BlitPipelineType::BlendMasked ||
+                      type == WebGPURenderInterface::BlitPipelineType::ReplaceMasked;
+  return gfx::pipeline_ref(
+      make_pipeline_config(PipelineKind::SimpleFilter, colorFormat, sampleCount, VertexLayoutKind::Fullscreen,
+                           masked ? StencilMode::EqualKeep : (useStencil ? StencilMode::AlwaysKeep : StencilMode::None),
+                           blend ? BlendMode::Premultiplied : BlendMode::None));
+}
+
+gfx::PipelineRef seed_resample_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool useStencil) {
+  return gfx::pipeline_ref(
+      make_pipeline_config(PipelineKind::SeedResample, colorFormat, sampleCount, VertexLayoutKind::Fullscreen,
+                           useStencil ? StencilMode::AlwaysKeep : StencilMode::None, BlendMode::None));
+}
+
+gfx::PipelineRef filter_pipeline(PipelineKind kind, wgpu::TextureFormat colorFormat,
+                                 VertexLayoutKind vertexLayout = VertexLayoutKind::Fullscreen,
+                                 BlendMode blendMode = BlendMode::None) {
+  return gfx::pipeline_ref(make_pipeline_config(kind, colorFormat, 1, vertexLayout, StencilMode::None, blendMode));
+}
+
+void queue_texture_upload_if_needed(ShaderTextureData& texture) {
+  if (texture.m_uploaded || texture.m_pendingUpload.empty()) {
+    return;
+  }
   const wgpu::TexelCopyTextureInfo dst{
-      .texture = texture,
+      .texture = texture.m_texture,
       .aspect = wgpu::TextureAspect::All,
   };
-  const wgpu::TexelCopyBufferLayout layout{
-      .offset = 0,
-      .bytesPerRow = width * BytesPerPixel,
-      .rowsPerImage = height,
-  };
-  webgpu::g_queue.WriteTexture(&dst, data, width * BytesPerPixel * height, &layout, &size);
-#endif
+  gfx::queue_texture_upload_data(texture.m_pendingUpload.data(), texture.m_rowBytes, texture.m_size.height, dst,
+                                 texture.m_size);
+  texture.m_pendingUpload.clear();
+  texture.m_pendingUpload.shrink_to_fit();
+  texture.m_uploaded = true;
 }
 
-wgpu::ComputeState compile_shader(const std::string_view& wgslSource, const std::string_view& label) {
-  const wgpu::ShaderSourceWGSL source{
-      wgpu::ShaderSourceWGSL::Init{
-          .nextInChain = nullptr,
-          .code = wgslSource,
-      },
-  };
-  const wgpu::ShaderModuleDescriptor desc{
-      .nextInChain = &source,
-      .label = label,
-  };
-  return {
-      .module = webgpu::g_device.CreateShaderModule(&desc),
-      .entryPoint = "main",
-  };
-}
-
-wgpu::StencilFaceState stencil_face(wgpu::CompareFunction compare, wgpu::StencilOperation passOp) {
-  return {
-      .compare = compare,
-      .failOp = wgpu::StencilOperation::Keep,
-      .depthFailOp = wgpu::StencilOperation::Keep,
-      .passOp = passOp,
-  };
-}
 } // namespace
-
-constexpr std::string_view vertexSource = R"(
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
-
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-@vertex
-fn main(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    var translatedPos = uniforms.translation.xy + in.position;
-
-    out.position = uniforms.mvp * vec4<f32>(translatedPos, 0.0, 1.0);
-    out.color = in.color;
-    out.uv = in.uv;
-    return out;
-}
-)"sv;
-
-constexpr std::string_view fragmentSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
-
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-
-@fragment
-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = in.color * textureSample(t, s, in.uv);
-    if (uniforms.gamma == 1.0) {
-        return color;
-    }
-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
-    return vec4<f32>(corrected_color, color.a);
-}
-)"sv;
-
-constexpr std::string_view gradientFragmentSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
-
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
-
-struct GradientUniforms {
-    function: i32,
-    num_stops: i32,
-    p: vec2<f32>,
-    v: vec2<f32>,
-    padding: vec2<f32>,
-    stop_colors: array<vec4<f32>, 16>,
-    stop_positions: array<vec4<f32>, 4>,
-};
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(1) @binding(0) var<uniform> gradient: GradientUniforms;
-
-const LINEAR: i32 = 0;
-const RADIAL: i32 = 1;
-const CONIC: i32 = 2;
-const REPEATING_LINEAR: i32 = 3;
-const REPEATING_RADIAL: i32 = 4;
-const REPEATING_CONIC: i32 = 5;
-const PI: f32 = 3.14159265;
-
-fn bayer_dither(position: vec4<f32>) -> f32 {
-    let bayer = array<u32, 64>(
-        0u, 32u, 8u, 40u, 2u, 34u, 10u, 42u,
-        48u, 16u, 56u, 24u, 50u, 18u, 58u, 26u,
-        12u, 44u, 4u, 36u, 14u, 46u, 6u, 38u,
-        60u, 28u, 52u, 20u, 62u, 30u, 54u, 22u,
-        3u, 35u, 11u, 43u, 1u, 33u, 9u, 41u,
-        51u, 19u, 59u, 27u, 49u, 17u, 57u, 25u,
-        15u, 47u, 7u, 39u, 13u, 45u, 5u, 37u,
-        63u, 31u, 55u, 23u, 61u, 29u, 53u, 21u
-    );
-    let x = u32(position.x) % 8u;
-    let y = u32(position.y) % 8u;
-    return (f32(bayer[x + y * 8u]) / 64.0 - 0.5) / 255.0;
-}
-
-fn stop_position(index: i32) -> f32 {
-    let stop_index = u32(index);
-    let group_index = stop_index / 4u;
-    let component_index = stop_index % 4u;
-    return gradient.stop_positions[group_index][component_index];
-}
-
-fn stop_color_mix(t: f32) -> vec4<f32> {
-    var color = gradient.stop_colors[0];
-
-    for (var i = 1; i < 16; i = i + 1) {
-        if (i < gradient.num_stops) {
-            color = mix(color, gradient.stop_colors[u32(i)], smoothstep(stop_position(i - 1), stop_position(i), t));
-        }
-    }
-
-    return color;
-}
-
-@fragment
-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var t = 0.0;
-
-    if (gradient.function == LINEAR || gradient.function == REPEATING_LINEAR) {
-        let dist_square = dot(gradient.v, gradient.v);
-        let v = in.uv - gradient.p;
-        t = dot(gradient.v, v) / dist_square;
-    } else if (gradient.function == RADIAL || gradient.function == REPEATING_RADIAL) {
-        let v = in.uv - gradient.p;
-        t = length(gradient.v * v);
-    } else if (gradient.function == CONIC || gradient.function == REPEATING_CONIC) {
-        let v = in.uv - gradient.p;
-        let rotated = vec2<f32>(
-            gradient.v.x * v.x + gradient.v.y * v.y,
-            -gradient.v.y * v.x + gradient.v.x * v.y
-        );
-        t = 0.5 + atan2(-rotated.x, rotated.y) / (2.0 * PI);
-    }
-
-    if (gradient.function == REPEATING_LINEAR ||
-        gradient.function == REPEATING_RADIAL ||
-        gradient.function == REPEATING_CONIC) {
-        let t0 = stop_position(0);
-        let t1 = stop_position(gradient.num_stops - 1);
-        let span = t1 - t0;
-        t = t0 + (t - t0) - span * floor((t - t0) / span);
-    }
-
-    let color = in.color * stop_color_mix(t);
-    if (uniforms.gamma == 1.0) {
-        return color;
-    }
-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
-    let dithered_color = clamp(corrected_color + vec3<f32>(bayer_dither(in.position)), vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(dithered_color, color.a);
-}
-)"sv;
-
-constexpr std::string_view fullscreenVertexSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(0.0, 0.0),
-    vec2(0.0, 2.0),
-    vec2(2.0, 0.0),
-);
-
-@vertex
-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    out.uv = uvs[vtxIdx];
-    return out;
-}
-)"sv;
-
-constexpr std::string_view blurVertexSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv0: vec2<f32>,
-    @location(1) uv1: vec2<f32>,
-    @location(2) uv2: vec2<f32>,
-    @location(3) uv3: vec2<f32>,
-    @location(4) uv4: vec2<f32>,
-    @location(5) uv5: vec2<f32>,
-    @location(6) uv6: vec2<f32>,
-};
-
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-const BLUR_NUM_WEIGHTS: i32 = 4;
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(0.0, 0.0),
-    vec2(0.0, 2.0),
-    vec2(2.0, 0.0),
-);
-
-fn blur_uv(uv: vec2<f32>, index: i32) -> vec2<f32> {
-    return uv - f32(index - BLUR_NUM_WEIGHTS + 1) * blur.texel_offset;
-}
-
-@vertex
-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    let uv = uvs[vtxIdx];
-    var out: VertexOutput;
-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    out.uv0 = blur_uv(uv, 0);
-    out.uv1 = blur_uv(uv, 1);
-    out.uv2 = blur_uv(uv, 2);
-    out.uv3 = blur_uv(uv, 3);
-    out.uv4 = blur_uv(uv, 4);
-    out.uv5 = blur_uv(uv, 5);
-    out.uv6 = blur_uv(uv, 6);
-    return out;
-}
-)"sv;
-
-constexpr std::string_view blitFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    return textureSample(t, s, uv);
-}
-)"sv;
-
-constexpr std::string_view opaqueBlitFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let color = textureSample(t, s, uv);
-    return vec4<f32>(color.rgb, 1.0);
-}
-)"sv;
-
-constexpr std::string_view colorMatrixFragmentSource = R"(
-struct ColorMatrixUniforms {
-    matrix: mat4x4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> color_matrix: ColorMatrixUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(t, s, uv);
-    let transformed_color = (color_matrix.matrix * tex_color).rgb;
-    return vec4<f32>(transformed_color, tex_color.a);
-}
-)"sv;
-
-constexpr std::string_view maskImageFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var mask_t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(t, s, uv);
-    let mask_alpha = textureSample(mask_t, s, uv).a;
-    return tex_color * mask_alpha;
-}
-)"sv;
-
-constexpr std::string_view blurFragmentSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-fn get_weight(index: i32) -> f32 {
-    return blur.weights[u32(abs(index))];
-}
-
-fn sample_blur(sample_uv: vec2<f32>, offset_index: i32) -> vec4<f32> {
-    let in_region = step(blur.tex_coord_min, sample_uv) * step(sample_uv, blur.tex_coord_max);
-    return textureSample(t, s, sample_uv) * get_weight(offset_index) * in_region.x * in_region.y;
-}
-
-@fragment
-fn main(@location(0) uv0: vec2<f32>, @location(1) uv1: vec2<f32>, @location(2) uv2: vec2<f32>,
-        @location(3) uv3: vec2<f32>, @location(4) uv4: vec2<f32>, @location(5) uv5: vec2<f32>,
-        @location(6) uv6: vec2<f32>) -> @location(0) vec4<f32> {
-    var color = sample_blur(uv0, -3);
-    color += sample_blur(uv1, -2);
-    color += sample_blur(uv2, -1);
-    color += sample_blur(uv3, 0);
-    color += sample_blur(uv4, 1);
-    color += sample_blur(uv5, 2);
-    color += sample_blur(uv6, 3);
-    return color;
-}
-)"sv;
-
-constexpr std::string_view regionBlitFragmentSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let sample_uv = mix(blur.tex_coord_min, blur.tex_coord_max, uv);
-    return textureSample(t, s, sample_uv);
-}
-)"sv;
-
-constexpr std::string_view dropShadowFragmentSource = R"(
-struct DropShadowUniforms {
-    color: vec4<f32>,
-    uv_offset: vec2<f32>,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> shadow: DropShadowUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let sample_uv = uv - shadow.uv_offset;
-    let in_region = step(shadow.tex_coord_min, sample_uv) * step(sample_uv, shadow.tex_coord_max);
-    let alpha = textureSample(t, s, sample_uv).a * in_region.x * in_region.y;
-    return shadow.color * alpha;
-}
-)"sv;
-
-inline constexpr uint64_t UniformBufferSize = 1048576; // 1mb
 
 Rml::CompiledGeometryHandle WebGPURenderInterface::CompileGeometry(Rml::Span<const Rml::Vertex> vertices,
                                                                    Rml::Span<const int> indices) {
   auto* geometryData = new ShaderGeometryData();
-#ifdef AURORA_PLATFORM_SWITCH
-  geometryData->m_vertexBuffer =
-      create_mapped_buffer("RmlUi Vertex Buffer", wgpu::BufferUsage::Vertex, vertices.data(),
-                           sizeof(Rml::Vertex) * vertices.size());
-  geometryData->m_indexBuffer =
-      create_mapped_buffer("RmlUi Index Buffer", wgpu::BufferUsage::Index, indices.data(), sizeof(int) * indices.size());
-#else
-  const wgpu::BufferDescriptor vtxBufferDesc{
-      .label = "RmlUi Vertex Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Vertex,
-      .size = AURORA_ALIGN(vertices.size() * sizeof(Rml::Vertex), 4),
-  };
-  geometryData->m_vertexBuffer = webgpu::g_device.CreateBuffer(&vtxBufferDesc);
-  webgpu::g_queue.WriteBuffer(geometryData->m_vertexBuffer, 0, vertices.data(), sizeof(Rml::Vertex) * vertices.size());
-
-  const wgpu::BufferDescriptor idxBufferDesc{
-      .label = "RmlUi Index Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Index,
-      .size = AURORA_ALIGN(indices.size() * sizeof(int), 4),
-  };
-  geometryData->m_indexBuffer = webgpu::g_device.CreateBuffer(&idxBufferDesc);
-  webgpu::g_queue.WriteBuffer(geometryData->m_indexBuffer, 0, indices.data(), sizeof(int) * indices.size());
-#endif
+  geometryData->vertices.assign(vertices.begin(), vertices.end());
+  geometryData->indices.reserve(indices.size());
+  for (const int index : indices) {
+    geometryData->indices.push_back(static_cast<uint32_t>(index));
+  }
 
   return reinterpret_cast<Rml::CompiledGeometryHandle>(geometryData);
 }
@@ -747,32 +426,42 @@ Rml::CompiledGeometryHandle WebGPURenderInterface::CompileGeometry(Rml::Span<con
 void WebGPURenderInterface::RenderGeometry(Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation,
                                            Rml::TextureHandle texture) {
   DrawGeometry(geometry, translation, texture,
-               m_pipelines[static_cast<size_t>(m_clipMaskEnabled ? PipelineType::Masked : PipelineType::Normal)]);
+               geometry_pipeline(m_renderTargetFormat, LayerSampleCount,
+                                 m_clipMaskEnabled ? PipelineType::Masked : PipelineType::Normal));
 }
 
 void WebGPURenderInterface::DrawGeometry(Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation,
-                                         Rml::TextureHandle texture, const wgpu::RenderPipeline& pipeline) {
+                                         Rml::TextureHandle texture, gfx::PipelineRef pipeline) {
   EnsureActiveLayerPass("RmlUi resumed geometry layer pass");
-  if (m_pass == nullptr) {
+  if (!m_passActive) {
     return;
   }
 
-  SetupRenderState(translation);
-
   auto* geometryData = reinterpret_cast<ShaderGeometryData*>(geometry);
   auto* textureData = reinterpret_cast<ShaderTextureData*>(texture != 0 ? texture : m_nullTexture);
+  if (geometryData == nullptr || textureData == nullptr) {
+    return;
+  }
+  queue_texture_upload_if_needed(*textureData);
 
-  m_pass.SetVertexBuffer(0, geometryData->m_vertexBuffer, 0, geometryData->m_vertexBuffer.GetSize());
-  m_pass.SetIndexBuffer(geometryData->m_indexBuffer, wgpu::IndexFormat::Uint32, 0,
-                        geometryData->m_indexBuffer.GetSize());
-  m_pass.SetPipeline(pipeline);
-  m_pass.SetBindGroup(0, m_drawCommonBindGroup ? m_drawCommonBindGroup : m_commonBindGroup, 1, &m_drawUniformOffset);
-  m_pass.SetBindGroup(1, textureData->m_bindGroup);
-  m_pass.DrawIndexed(geometryData->m_indexBuffer.GetSize() / sizeof(int));
-
-#ifndef AURORA_PLATFORM_SWITCH
-  m_uniformCurrentOffset += AURORA_ALIGN(sizeof(UniformBlock), 256);
-#endif
+  const auto uniformRange = SetupRenderState(translation);
+  const auto vertexRange =
+      gfx::push_verts(reinterpret_cast<const uint8_t*>(geometryData->vertices.data()),
+                      geometryData->vertices.size() * sizeof(Rml::Vertex), rmlBufferOffsetAlignment);
+  const auto indexRange = gfx::push_indices(reinterpret_cast<const uint8_t*>(geometryData->indices.data()),
+                                            geometryData->indices.size() * sizeof(uint32_t), rmlBufferOffsetAlignment);
+  gfx::push_draw_command(DrawData{
+      .pipeline = pipeline,
+      .vertexRange = vertexRange,
+      .indexRange = indexRange,
+      .uniformRange = uniformRange,
+      .bindGroup1 = texture_bind_group_ref(textureData->m_textureView),
+      .drawKind = static_cast<uint32_t>(DrawKind::Geometry),
+      .indexCount = static_cast<uint32_t>(geometryData->indices.size()),
+      .stencilRef = m_stencilRef,
+      .blendConstant = {0.f, 0.f, 0.f, 0.f},
+      .hasBlendConstant = 1,
+  });
 }
 
 void WebGPURenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
@@ -780,6 +469,32 @@ void WebGPURenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry
 }
 
 Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions, const Rml::String& source) {
+  if (const auto runtimeTexture = load_runtime_texture(source)) {
+    const size_t size = static_cast<size_t>(runtimeTexture->width) * static_cast<size_t>(runtimeTexture->height) * 4;
+    if (runtimeTexture->width == 0 || runtimeTexture->height == 0 || runtimeTexture->rgba8.size() < size) {
+      Log.error("Runtime texture provider returned invalid texture! Path: {}", source);
+      return 0;
+    }
+
+    const auto* texels = reinterpret_cast<const Rml::byte*>(runtimeTexture->rgba8.data());
+    std::vector<Rml::byte> premultiplied;
+    if (!runtimeTexture->premultipliedAlpha) {
+      premultiplied.assign(texels, texels + size);
+      for (size_t offset = 0; offset < premultiplied.size(); offset += 4) {
+        const uint8_t alpha = premultiplied[offset + 3];
+        for (size_t channel = 0; channel < 3; ++channel) {
+          premultiplied[offset + channel] = static_cast<uint8_t>(
+              (static_cast<uint32_t>(premultiplied[offset + channel]) * static_cast<uint32_t>(alpha)) / 255);
+        }
+      }
+      texels = premultiplied.data();
+    }
+
+    dimensions.x = static_cast<int>(runtimeTexture->width);
+    dimensions.y = static_cast<int>(runtimeTexture->height);
+    return GenerateTexture({texels, size}, dimensions);
+  }
+
   // load texels from image source
   const auto image = get_image(source);
   if (image.size == 0) {
@@ -794,10 +509,6 @@ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions,
 
 Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::byte> source,
                                                           Rml::Vector2i source_dimensions) {
-  if (source_dimensions.x <= 0 || source_dimensions.y <= 0 || source.size() == 0) {
-    return 0;
-  }
-
   auto* texData = new ShaderTextureData();
   const wgpu::Extent3D size{
       .width = static_cast<uint32_t>(source_dimensions.x),
@@ -813,73 +524,12 @@ Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::b
   };
   texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
   texData->m_textureView = texData->m_texture.CreateView(nullptr);
-#ifdef AURORA_PLATFORM_SWITCH
+
   constexpr uint32_t BytesPerPixel = 4;
-  const uint32_t bytesPerRow = size.width * BytesPerPixel;
-  const uint32_t copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
-  const uint64_t uploadSize = static_cast<uint64_t>(copyBytesPerRow) * size.height;
-  const wgpu::BufferDescriptor uploadDesc{
-      .label = "RmlUi Texture Upload Buffer",
-      .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
-      .size = uploadSize,
-      .mappedAtCreation = true,
-  };
-  wgpu::Buffer uploadBuffer = webgpu::g_device.CreateBuffer(&uploadDesc);
-  auto* dst = static_cast<uint8_t*>(uploadBuffer.GetMappedRange(0, uploadSize));
-  if (dst != nullptr) {
-    for (uint32_t row = 0; row < size.height; ++row) {
-      std::memcpy(dst + static_cast<size_t>(row) * copyBytesPerRow,
-                  source.data() + static_cast<size_t>(row) * bytesPerRow, bytesPerRow);
-      if (copyBytesPerRow > bytesPerRow) {
-        std::memset(dst + static_cast<size_t>(row) * copyBytesPerRow + bytesPerRow, 0, copyBytesPerRow - bytesPerRow);
-      }
-    }
-  }
-  uploadBuffer.Unmap();
-
-  const wgpu::TexelCopyBufferInfo src{
-      .layout =
-          {
-              .offset = 0,
-              .bytesPerRow = copyBytesPerRow,
-              .rowsPerImage = size.height,
-          },
-      .buffer = uploadBuffer,
-  };
-  const wgpu::TexelCopyTextureInfo dstTexture{
-      .texture = texData->m_texture,
-      .aspect = wgpu::TextureAspect::All,
-  };
-  if (m_encoder != nullptr) {
-    EndActivePass();
-    m_encoder.CopyBufferToTexture(&src, &dstTexture, &size);
-    m_frameUploadBuffers.push_back(uploadBuffer);
-  } else {
-    m_pendingTextureUploads.push_back({
-        .buffer = uploadBuffer,
-        .texture = texData->m_texture,
-        .size = size,
-        .bytesPerRow = copyBytesPerRow,
-        .rowsPerImage = size.height,
-    });
-  }
-#else
-  upload_texture_data(texData->m_texture, source.data(), size.width, size.height);
-#endif
-
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = texData->m_textureView,
-      },
-  };
-  const wgpu::BindGroupDescriptor bindGroupDesc{
-      .layout = m_imageBindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
-  };
-  texData->m_bindGroup = webgpu::g_device.CreateBindGroup(&bindGroupDesc);
-
+  texData->m_size = size;
+  texData->m_rowBytes = static_cast<uint32_t>(source_dimensions.x) * BytesPerPixel;
+  texData->m_pendingUpload.assign(source.begin(), source.end());
+  texData->m_uploaded = texData->m_pendingUpload.empty();
   return reinterpret_cast<Rml::TextureHandle>(texData);
 }
 
@@ -898,25 +548,22 @@ void WebGPURenderInterface::SetScissorRegion(Rml::Rectanglei region) {
 }
 
 void WebGPURenderInterface::ApplyScissorRegion() {
-  if (m_pass == nullptr) {
+  if (!m_passActive) {
     return;
   }
 
   ApplyScissorRegion(GetActiveScissorRegion());
 }
 
-void WebGPURenderInterface::ApplyScissorRegion(Rml::Rectanglei region) {
-  if (m_pass == nullptr) {
-    return;
-  }
-
+void WebGPURenderInterface::ApplyScissorRegion(Rml::Rectanglei region) const {
   const int maxWidth = static_cast<int>(m_frameSize.width);
   const int maxHeight = static_cast<int>(m_frameSize.height);
   const uint32_t x = static_cast<uint32_t>(std::clamp(region.Left(), 0, maxWidth));
   const uint32_t y = static_cast<uint32_t>(std::clamp(region.Top(), 0, maxHeight));
   const uint32_t width = static_cast<uint32_t>(std::clamp(region.Width(), 0, maxWidth - static_cast<int>(x)));
   const uint32_t height = static_cast<uint32_t>(std::clamp(region.Height(), 0, maxHeight - static_cast<int>(y)));
-  m_pass.SetScissorRect(x, y, width, height);
+  gfx::set_scissor(
+      {static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(width), static_cast<int32_t>(height)});
 }
 
 Rml::Rectanglei WebGPURenderInterface::GetActiveScissorRegion() const {
@@ -944,11 +591,6 @@ void WebGPURenderInterface::EnableClipMask(bool enable) {
   m_clipMaskEnabled = enable;
   if (!enable) {
     m_stencilRef = 0;
-    if (m_pass != nullptr) {
-      m_pass.SetStencilReference(0);
-    }
-  } else if (m_pass != nullptr) {
-    m_pass.SetStencilReference(m_stencilRef);
   }
 }
 
@@ -962,7 +604,7 @@ void WebGPURenderInterface::RenderToClipMask(Rml::ClipMaskOperation operation, R
   }
 
   EnsureActiveLayerPass("RmlUi resumed clip mask layer pass");
-  if (m_pass == nullptr) {
+  if (!m_passActive) {
     return;
   }
 
@@ -972,23 +614,27 @@ void WebGPURenderInterface::RenderToClipMask(Rml::ClipMaskOperation operation, R
   switch (operation) {
   case Rml::ClipMaskOperation::Set:
     m_translationMatrix = Rml::Matrix4f::Identity();
-    m_pass.SetStencilReference(0);
-    DrawGeometry(m_clipResetGeometry, {}, 0, m_pipelines[static_cast<size_t>(PipelineType::ClipReplace)]);
+    m_stencilRef = 0;
+    DrawGeometry(m_clipResetGeometry, {}, 0,
+                 geometry_pipeline(m_renderTargetFormat, LayerSampleCount, PipelineType::ClipReplace));
     m_translationMatrix = prevMatrix;
 
     m_stencilRef = 1;
-    m_pass.SetStencilReference(m_stencilRef);
-    DrawGeometry(geometry, translation, 0, m_pipelines[static_cast<size_t>(PipelineType::ClipReplace)]);
+    DrawGeometry(geometry, translation, 0,
+                 geometry_pipeline(m_renderTargetFormat, LayerSampleCount, PipelineType::ClipReplace));
     break;
   case Rml::ClipMaskOperation::SetInverse:
     m_translationMatrix = Rml::Matrix4f::Identity();
-    m_pass.SetStencilReference(1);
-    DrawGeometry(m_clipResetGeometry, {}, 0, m_pipelines[static_cast<size_t>(PipelineType::ClipReplace)]);
+    m_stencilRef = 1;
+    DrawGeometry(m_clipResetGeometry, {}, 0,
+                 geometry_pipeline(m_renderTargetFormat, LayerSampleCount, PipelineType::ClipReplace));
     m_translationMatrix = prevMatrix;
 
     m_stencilRef = 1;
-    m_pass.SetStencilReference(0);
-    DrawGeometry(geometry, translation, 0, m_pipelines[static_cast<size_t>(PipelineType::ClipReplace)]);
+    m_stencilRef = 0;
+    DrawGeometry(geometry, translation, 0,
+                 geometry_pipeline(m_renderTargetFormat, LayerSampleCount, PipelineType::ClipReplace));
+    m_stencilRef = 1;
     break;
   case Rml::ClipMaskOperation::Intersect:
     if (m_stencilRef == std::numeric_limits<uint8_t>::max()) {
@@ -996,13 +642,11 @@ void WebGPURenderInterface::RenderToClipMask(Rml::ClipMaskOperation operation, R
       break;
     }
 
-    m_pass.SetStencilReference(m_stencilRef);
-    DrawGeometry(geometry, translation, 0, m_pipelines[static_cast<size_t>(PipelineType::ClipIntersect)]);
+    DrawGeometry(geometry, translation, 0,
+                 geometry_pipeline(m_renderTargetFormat, LayerSampleCount, PipelineType::ClipIntersect));
     ++m_stencilRef;
     break;
   }
-
-  m_pass.SetStencilReference(m_stencilRef);
 }
 
 void WebGPURenderInterface::SetTransform(const Rml::Matrix4f* transform) {
@@ -1033,7 +677,6 @@ void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char*
   };
   target.texture = webgpu::g_device.CreateTexture(&textureDesc);
   target.view = target.texture.CreateView(nullptr);
-  target.bindGroup = CreateImageBindGroup(target.view);
 
   if (useMultisampling) {
     const wgpu::TextureDescriptor multisampleTextureDesc{
@@ -1048,21 +691,6 @@ void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char*
     target.multisampleTexture = webgpu::g_device.CreateTexture(&multisampleTextureDesc);
     target.multisampleView = target.multisampleTexture.CreateView(nullptr);
   }
-}
-
-wgpu::BindGroup WebGPURenderInterface::CreateImageBindGroup(const wgpu::TextureView& view) const {
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = view,
-      },
-  };
-  const wgpu::BindGroupDescriptor bindGroupDesc{
-      .layout = m_imageBindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
-  };
-  return webgpu::g_device.CreateBindGroup(&bindGroupDesc);
 }
 
 void WebGPURenderInterface::EnsureFrameTargets(const wgpu::Extent3D& size) {
@@ -1122,43 +750,33 @@ TexCoordLimits WebGPURenderInterface::GetPostprocessTexCoordLimits(Rml::Rectangl
   };
 }
 
-void WebGPURenderInterface::ApplyViewport() {
-  if (m_pass != nullptr) {
-    m_pass.SetViewport(m_viewport.left, m_viewport.top, m_viewport.width, m_viewport.height, m_viewport.znear,
-                       m_viewport.zfar);
-  }
-}
+void WebGPURenderInterface::ApplyViewport() const { gfx::set_viewport(m_viewport); }
 
-void WebGPURenderInterface::ApplyFullFrameScissor() {
-  if (m_pass != nullptr) {
-    m_pass.SetScissorRect(0, 0, m_frameSize.width, m_frameSize.height);
-  }
+void WebGPURenderInterface::ApplyFullFrameScissor() const {
+  gfx::set_scissor({0, 0, static_cast<int32_t>(m_frameSize.width), static_cast<int32_t>(m_frameSize.height)});
 }
 
 void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view, wgpu::LoadOp loadOp, const char* label,
                                                   bool clearStencil) {
   EndActivePass();
-  (void)clearStencil;
-
-  const std::array attachments{
-      wgpu::RenderPassColorAttachment{
-          .view = view,
-          .loadOp = loadOp,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.f, 0.f, 0.f, 0.f},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDesc{
+  gfx::begin_color_pass({
       .label = label,
-      .colorAttachmentCount = attachments.size(),
-      .colorAttachments = attachments.data(),
-  };
-  m_pass = m_encoder.BeginRenderPass(&renderPassDesc);
+      .colorView = view,
+      .depthStencilView = clearStencil ? GetClipMaskStencilView(m_frameSize) : wgpu::TextureView{},
+      .targetSize = m_frameSize,
+      .sampleCount = 1,
+      .colorLoadOp = loadOp,
+      .colorStoreOp = wgpu::StoreOp::Store,
+      .clearColor = {0.f, 0.f, 0.f, 0.f},
+      .hasStencil = clearStencil,
+      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Undefined,
+      .stencilStoreOp = clearStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
+      .stencilClearValue = 0,
+      .observable = true,
+  });
+  m_passActive = true;
   ApplyViewport();
   ApplyScissorRegion();
-  if constexpr (EnableClipMaskStencil) {
-    m_pass.SetStencilReference(m_stencilRef);
-  }
 }
 
 void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp loadOp, const char* label,
@@ -1168,64 +786,63 @@ void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp 
 
   const RenderTarget& target = m_layers[layer];
   const bool multisampled = LayerSampleCount > 1 && static_cast<bool>(target.multisampleView);
-  const std::array attachments{
-      wgpu::RenderPassColorAttachment{
-          .view = multisampled ? target.multisampleView : target.view,
-          .resolveTarget = multisampled && resolveMultisampled ? target.view : nullptr,
-          .loadOp = loadOp,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.f, 0.f, 0.f, 0.f},
-      },
-  };
-  wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{};
-  const wgpu::RenderPassDepthStencilAttachment* depthStencilAttachmentPtr = nullptr;
-  if constexpr (EnableClipMaskStencil) {
-    depthStencilAttachment = {
-        .view = GetClipMaskStencilView(m_frameSize),
-        .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
-        .stencilStoreOp = wgpu::StoreOp::Store,
-        .stencilClearValue = 0,
-    };
-    depthStencilAttachmentPtr = &depthStencilAttachment;
-  }
-  const wgpu::RenderPassDescriptor renderPassDesc{
+  gfx::begin_color_pass({
       .label = label,
-      .colorAttachmentCount = attachments.size(),
-      .colorAttachments = attachments.data(),
-      .depthStencilAttachment = depthStencilAttachmentPtr,
-  };
-  m_pass = m_encoder.BeginRenderPass(&renderPassDesc);
+      .colorView = multisampled ? target.multisampleView : target.view,
+      .resolveView = multisampled && resolveMultisampled ? target.view : wgpu::TextureView{},
+      .depthStencilView = GetClipMaskStencilView(m_frameSize),
+      .targetSize = m_frameSize,
+      .sampleCount = multisampled ? LayerSampleCount : 1,
+      .colorLoadOp = loadOp,
+      .colorStoreOp = wgpu::StoreOp::Store,
+      .clearColor = {0.f, 0.f, 0.f, 0.f},
+      .hasStencil = true,
+      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+      .stencilStoreOp = wgpu::StoreOp::Store,
+      .stencilClearValue = 0,
+      .observable = true,
+  });
+  m_passActive = true;
   ApplyViewport();
   ApplyScissorRegion();
-  if constexpr (EnableClipMaskStencil) {
-    m_pass.SetStencilReference(m_stencilRef);
-  }
 }
 
 void WebGPURenderInterface::EnsureFrameRenderingStarted() {
-  if (m_frameRenderingStarted || m_encoder == nullptr || m_layers.empty() || !m_layers[0].view) {
+  if (m_frameRenderingStarted || !m_frameActive || m_layers.empty() || !m_layers[0].view) {
     return;
   }
 
   m_frameRenderingStarted = true;
-  const wgpu::BindGroup seedBindGroup = CreateImageBindGroup(m_frameSeedView);
+  if (m_baseLayerContent == BaseLayerContent::Transparent) {
+    BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi transparent base layer pass", true);
+    return;
+  }
+
+  const auto seedBindGroup = texture_bind_group_ref(m_frameSeedView);
+  const auto seedUniformRange = gfx::push_uniform(SeedResampleUniformBlock{
+      .samplerMode = sampler_mode(),
+      .frameWidth = static_cast<float>(m_frameSize.width),
+      .frameHeight = static_cast<float>(m_frameSize.height),
+  });
 
   if (m_layers[0].multisampleView) {
     BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi base layer seed pass", true);
     ApplyFullFrameScissor();
-    DrawFullscreenTexture(seedBindGroup, m_layerOpaqueBlitPipeline);
+    DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, LayerSampleCount, true),
+                          uniform_bind_group_ref(), seedUniformRange);
     BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass");
   } else {
     BeginRenderTargetPass(m_layers[0].view, wgpu::LoadOp::Clear, "RmlUi game frame copy pass");
     ApplyFullFrameScissor();
-    DrawFullscreenTexture(seedBindGroup, m_opaqueBlitPipeline);
+    DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, 1, false),
+                          uniform_bind_group_ref(), seedUniformRange);
     BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass", true);
   }
 }
 
 void WebGPURenderInterface::EnsureActiveLayerPass(const char* label) {
   EnsureFrameRenderingStarted();
-  if (m_pass != nullptr || m_encoder == nullptr || m_activeLayer >= m_layers.size() || !m_layers[m_activeLayer].view) {
+  if (m_passActive || !m_frameActive || m_activeLayer >= m_layers.size() || !m_layers[m_activeLayer].view) {
     return;
   }
 
@@ -1233,36 +850,43 @@ void WebGPURenderInterface::EnsureActiveLayerPass(const char* label) {
 }
 
 void WebGPURenderInterface::EndActivePass() {
-  if (m_pass != nullptr) {
-    m_pass.End();
-    m_pass = nullptr;
+  if (m_passActive) {
+    gfx::end_color_pass();
+    m_passActive = false;
   }
 }
 
-void WebGPURenderInterface::DrawFullscreenTexture(const wgpu::BindGroup& bindGroup,
-                                                  const wgpu::RenderPipeline& pipeline,
-                                                  const wgpu::BindGroup* extraBindGroup, uint32_t extraDynamicOffset,
-                                                  bool extraBindGroupHasDynamicOffset) {
-  constexpr uint32_t uniformOffset = 0;
-  m_pass.SetPipeline(pipeline);
-  m_pass.SetBindGroup(0, m_commonBindGroup, 1, &uniformOffset);
-  m_pass.SetBindGroup(1, bindGroup);
-  if (extraBindGroup != nullptr) {
-    if (extraBindGroupHasDynamicOffset) {
-      m_pass.SetBindGroup(2, *extraBindGroup, 1, &extraDynamicOffset);
-    } else {
-      m_pass.SetBindGroup(2, *extraBindGroup);
-    }
+void WebGPURenderInterface::DrawFullscreenTexture(gfx::BindGroupRef bindGroup, gfx::PipelineRef pipeline,
+                                                  gfx::BindGroupRef extraBindGroup, gfx::Range extraUniformRange,
+                                                  bool extraBindGroupHasDynamicOffset,
+                                                  std::array<float, 4> blendConstant, bool hasBlendConstant) {
+  if (!m_passActive) {
+    return;
   }
-  m_pass.Draw(3);
+
+  gfx::push_draw_command(DrawData{
+      .pipeline = pipeline,
+      .uniformRange = {},
+      .bindGroup1 = bindGroup,
+      .bindGroup2 = extraBindGroup,
+      .bindGroup2DynamicOffset = extraUniformRange.offset,
+      .dynamicBindGroupMask = extraBindGroup != 0 && extraBindGroupHasDynamicOffset ? (1u << 2u) : 0u,
+      .drawKind = static_cast<uint32_t>(DrawKind::Fullscreen),
+      .vertexCount = 3,
+      .stencilRef = m_stencilRef,
+      .blendConstant = blendConstant,
+      .hasBlendConstant = hasBlendConstant ? 1u : 0u,
+  });
 }
 
-void WebGPURenderInterface::CompositeToTarget(const wgpu::BindGroup& bindGroup, const wgpu::TextureView& view,
-                                              wgpu::LoadOp loadOp, const wgpu::RenderPipeline& pipeline,
-                                              const char* label, const wgpu::BindGroup* extraBindGroup,
-                                              uint32_t extraDynamicOffset, bool extraBindGroupHasDynamicOffset) {
+void WebGPURenderInterface::CompositeToTarget(gfx::BindGroupRef bindGroup, const wgpu::TextureView& view,
+                                              wgpu::LoadOp loadOp, gfx::PipelineRef pipeline, const char* label,
+                                              gfx::BindGroupRef extraBindGroup, gfx::Range extraUniformRange,
+                                              bool extraBindGroupHasDynamicOffset, std::array<float, 4> blendConstant,
+                                              bool hasBlendConstant) {
   BeginRenderTargetPass(view, loadOp, label);
-  DrawFullscreenTexture(bindGroup, pipeline, extraBindGroup, extraDynamicOffset, extraBindGroupHasDynamicOffset);
+  DrawFullscreenTexture(bindGroup, pipeline, extraBindGroup, extraUniformRange, extraBindGroupHasDynamicOffset,
+                        blendConstant, hasBlendConstant);
 }
 
 void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDestination, const RenderTarget& temp) {
@@ -1278,8 +902,6 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
 
   auto write_blur_uniform = [&](Rml::Vector2f texelOffset, Rml::Rectanglei texCoordRegion, float radius,
                                 Rml::Vector4f weights) {
-    const uint32_t offset = m_blurUniformCurrentOffset;
-    m_blurUniformCurrentOffset += AURORA_ALIGN(sizeof(BlurUniformBlock), 256);
     const TexCoordLimits texCoordLimits = GetPostprocessTexCoordLimits(texCoordRegion);
     const BlurUniformBlock uniform{
         .texelOffset = texelOffset,
@@ -1289,8 +911,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
         .texCoordMax = texCoordLimits.max,
         .weights = weights,
     };
-    webgpu::g_queue.WriteBuffer(m_blurUniformBuffer, offset, &uniform, sizeof(uniform));
-    return offset;
+    return gfx::push_uniform(uniform);
   };
   auto write_region_blit_uniform = [&](Rml::Rectanglei texCoordRegion, Rml::Vector4f weights) {
     const float viewportWidth = std::max(m_viewport.width, 1.f);
@@ -1303,8 +924,6 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
     const int bottom = std::clamp(texCoordRegion.Bottom(), top, maxHeight);
     const Rml::Vector2f viewportOrigin{m_viewport.left, m_viewport.top};
     const Rml::Vector2f viewportSize{viewportWidth, viewportHeight};
-    const uint32_t offset = m_blurUniformCurrentOffset;
-    m_blurUniformCurrentOffset += AURORA_ALIGN(sizeof(BlurUniformBlock), 256);
     const BlurUniformBlock uniform{
         .texelOffset = {},
         .radius = 0.f,
@@ -1315,8 +934,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
             (Rml::Vector2f(static_cast<float>(right), static_cast<float>(bottom)) - viewportOrigin) / viewportSize,
         .weights = weights,
     };
-    webgpu::g_queue.WriteBuffer(m_blurUniformBuffer, offset, &uniform, sizeof(uniform));
-    return offset;
+    return gfx::push_uniform(uniform);
   };
 
   int passLevel = 0;
@@ -1336,60 +954,69 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
     const RenderTarget& destination = fromSource ? temp : sourceDestination;
 
     BeginRenderTargetPass(destination.view, wgpu::LoadOp::Clear, "RmlUi blur downsample pass");
-    m_pass.SetViewport(m_viewport.left, m_viewport.top, std::max(m_viewport.width * 0.5f, 1.f),
-                       std::max(m_viewport.height * 0.5f, 1.f), m_viewport.znear, m_viewport.zfar);
+    gfx::set_viewport({m_viewport.left, m_viewport.top, std::max(m_viewport.width * 0.5f, 1.f),
+                       std::max(m_viewport.height * 0.5f, 1.f), m_viewport.znear, m_viewport.zfar});
     ApplyScissorRegion(scissor);
-    DrawFullscreenTexture(source.bindGroup, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)]);
+    DrawFullscreenTexture(texture_bind_group_ref(source.view),
+                          blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false));
   }
 
   if ((passLevel % 2) == 0) {
     BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi blur transfer pass");
     ApplyViewport();
     ApplyScissorRegion(scissor);
-    DrawFullscreenTexture(sourceDestination.bindGroup, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)]);
+    DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
+                          blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false));
   }
 
-  const uint32_t verticalOffset =
+  const auto verticalRange =
       write_blur_uniform({0.f, 1.f / std::max(m_viewport.height, 1.f)}, scissor, radius, weights);
   BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi vertical blur pass");
   ApplyScissorRegion(scissor);
-  DrawFullscreenTexture(temp.bindGroup, m_blurPipeline, &m_blurBindGroup, verticalOffset);
+  DrawFullscreenTexture(texture_bind_group_ref(temp.view),
+                        filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
+                        uniform_bind_group_ref(), verticalRange);
 
-  const uint32_t horizontalOffset =
+  const auto horizontalRange =
       write_blur_uniform({1.f / std::max(m_viewport.width, 1.f), 0.f}, scissor, radius, weights);
   BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi horizontal blur pass");
   ApplyScissorRegion(scissor);
-  DrawFullscreenTexture(sourceDestination.bindGroup, m_blurPipeline, &m_blurBindGroup, horizontalOffset);
+  DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
+                        filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
+                        uniform_bind_group_ref(), horizontalRange);
 
-  const uint32_t upscaleOffset = write_region_blit_uniform(scissor, weights);
+  const auto upscaleRange = write_region_blit_uniform(scissor, weights);
   BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi blur upscale pass");
-  m_pass.SetViewport(static_cast<float>(originalScissor.Left()), static_cast<float>(originalScissor.Top()),
+  gfx::set_viewport({static_cast<float>(originalScissor.Left()), static_cast<float>(originalScissor.Top()),
                      static_cast<float>(std::max(originalScissor.Width(), 1)),
-                     static_cast<float>(std::max(originalScissor.Height(), 1)), 0.f, 1.f);
+                     static_cast<float>(std::max(originalScissor.Height(), 1)), 0.f, 1.f});
   ApplyScissorRegion(originalScissor);
-  DrawFullscreenTexture(temp.bindGroup, m_regionBlitPipeline, &m_blurBindGroup, upscaleOffset);
+  DrawFullscreenTexture(texture_bind_group_ref(temp.view),
+                        filter_pipeline(PipelineKind::RegionBlit, m_renderTargetFormat), uniform_bind_group_ref(),
+                        upscaleRange);
 
-  const Rml::Vector2i targetMin = scissor.p0 * (1 << passLevel);
-  const Rml::Vector2i targetMax = scissor.p1 * (1 << passLevel);
-  const Rml::Rectanglei targetRegion = Rml::Rectanglei::FromCorners(targetMin, targetMax);
+  const auto targetMin = scissor.p0 * (1 << passLevel);
+  const auto targetMax = scissor.p1 * (1 << passLevel);
+  const auto targetRegion = Rml::Rectanglei::FromCorners(targetMin, targetMax);
   if (targetRegion.p0 != originalScissor.p0 || targetRegion.p1 != originalScissor.p1) {
     BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Load, "RmlUi blur power-of-two upscale pass");
-    m_pass.SetViewport(static_cast<float>(targetRegion.Left()), static_cast<float>(targetRegion.Top()),
+    gfx::set_viewport({static_cast<float>(targetRegion.Left()), static_cast<float>(targetRegion.Top()),
                        static_cast<float>(std::max(targetRegion.Width(), 1)),
-                       static_cast<float>(std::max(targetRegion.Height(), 1)), 0.f, 1.f);
+                       static_cast<float>(std::max(targetRegion.Height(), 1)), 0.f, 1.f});
     ApplyScissorRegion(targetRegion);
-    DrawFullscreenTexture(temp.bindGroup, m_regionBlitPipeline, &m_blurBindGroup, upscaleOffset);
+    DrawFullscreenTexture(texture_bind_group_ref(temp.view),
+                          filter_pipeline(PipelineKind::RegionBlit, m_renderTargetFormat), uniform_bind_group_ref(),
+                          upscaleRange);
   }
 }
 
-void WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterHandle> filters) {
+size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterHandle> filters) {
   if constexpr (!EnableAdvancedFilters) {
     (void)filters;
-    return;
+    return 0;
   }
 
-  constexpr size_t sourceIndex = 0;
-  constexpr size_t shadowIndex = 1;
+  size_t sourceIndex = 0;
   constexpr size_t tempIndex = 2;
 
   for (Rml::CompiledFilterHandle filterHandle : filters) {
@@ -1397,20 +1024,24 @@ void WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterHan
     if (filter == nullptr) {
       continue;
     }
+    const size_t scratchIndex = sourceIndex == 0 ? 1 : 0;
 
     switch (filter->type) {
     case FilterType::Opacity: {
-      const wgpu::Color blendColor{filter->opacity, filter->opacity, filter->opacity, filter->opacity};
-      BeginRenderTargetPass(m_postprocessTargets[shadowIndex].view, wgpu::LoadOp::Clear, "RmlUi opacity pass");
-      m_pass.SetBlendConstant(&blendColor);
-      DrawFullscreenTexture(m_postprocessTargets[sourceIndex].bindGroup, m_opacityPipeline);
-      CompositeToTarget(m_postprocessTargets[shadowIndex].bindGroup, m_postprocessTargets[sourceIndex].view,
-                        wgpu::LoadOp::Clear, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)],
-                        "RmlUi opacity result copy pass");
+      const SimpleFilterUniformBlock simpleFilterUniform{
+          .matrix = to_shader_matrix(Rml::Matrix4f::Identity()),
+          .opacity = {filter->opacity, 0.f, 0.f, 0.f},
+      };
+      const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
+      BeginRenderTargetPass(m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear, "RmlUi opacity pass");
+      DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                            filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), uniform_bind_group_ref(),
+                            simpleFilterRange);
+      sourceIndex = scratchIndex;
       break;
     }
     case FilterType::Blur:
-      RenderBlur(filter->sigma, m_postprocessTargets[sourceIndex], m_postprocessTargets[shadowIndex]);
+      RenderBlur(filter->sigma, m_postprocessTargets[sourceIndex], m_postprocessTargets[tempIndex]);
       break;
     case FilterType::DropShadow: {
       TexCoordLimits texCoordLimits = GetPostprocessTexCoordLimits();
@@ -1434,60 +1065,54 @@ void WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterHan
           .texCoordMin = texCoordLimits.min,
           .texCoordMax = texCoordLimits.max,
       };
-      const uint32_t dropShadowOffset = m_dropShadowUniformCurrentOffset;
-      m_dropShadowUniformCurrentOffset += AURORA_ALIGN(sizeof(DropShadowUniformBlock), 256);
-      webgpu::g_queue.WriteBuffer(m_dropShadowUniformBuffer, dropShadowOffset, &dropShadowUniform,
-                                  sizeof(dropShadowUniform));
-      CompositeToTarget(m_postprocessTargets[sourceIndex].bindGroup, m_postprocessTargets[shadowIndex].view,
-                        wgpu::LoadOp::Clear, m_dropShadowPipeline, "RmlUi drop shadow pass", &m_dropShadowBindGroup,
-                        dropShadowOffset);
+      const auto dropShadowRange = gfx::push_uniform(dropShadowUniform);
+      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        filter_pipeline(PipelineKind::DropShadow, m_renderTargetFormat), "RmlUi drop shadow pass",
+                        uniform_bind_group_ref(), dropShadowRange);
 
-      RenderBlur(filter->sigma, m_postprocessTargets[shadowIndex], m_postprocessTargets[tempIndex]);
+      RenderBlur(filter->sigma, m_postprocessTargets[scratchIndex], m_postprocessTargets[tempIndex]);
 
-      CompositeToTarget(m_postprocessTargets[sourceIndex].bindGroup, m_postprocessTargets[shadowIndex].view,
-                        wgpu::LoadOp::Load, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Blend)],
+      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Load,
+                        blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Blend, false),
                         "RmlUi drop shadow source composite pass");
-      CompositeToTarget(m_postprocessTargets[shadowIndex].bindGroup, m_postprocessTargets[sourceIndex].view,
-                        wgpu::LoadOp::Clear, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)],
-                        "RmlUi drop shadow result copy pass");
+      sourceIndex = scratchIndex;
       break;
     }
     case FilterType::ColorMatrix: {
-      const ColorMatrixUniformBlock colorMatrixUniform{
+      const SimpleFilterUniformBlock simpleFilterUniform{
           .matrix = to_shader_matrix(filter->colorMatrix),
+          .opacity = {1.f, 0.f, 0.f, 0.f},
       };
-      const uint32_t colorMatrixOffset = m_shaderUniformCurrentOffset;
-      m_shaderUniformCurrentOffset += AURORA_ALIGN(sizeof(ColorMatrixUniformBlock), 256);
-      webgpu::g_queue.WriteBuffer(m_shaderUniformBuffer, colorMatrixOffset, &colorMatrixUniform,
-                                  sizeof(colorMatrixUniform));
+      const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
 
-      CompositeToTarget(m_postprocessTargets[sourceIndex].bindGroup, m_postprocessTargets[shadowIndex].view,
-                        wgpu::LoadOp::Clear, m_colorMatrixPipeline, "RmlUi color matrix pass", &m_shaderBindGroup,
-                        colorMatrixOffset);
-      CompositeToTarget(m_postprocessTargets[shadowIndex].bindGroup, m_postprocessTargets[sourceIndex].view,
-                        wgpu::LoadOp::Clear, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)],
-                        "RmlUi color matrix result copy pass");
+      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), "RmlUi color matrix pass",
+                        uniform_bind_group_ref(), simpleFilterRange);
+      sourceIndex = scratchIndex;
       break;
     }
     case FilterType::MaskImage: {
-      CompositeToTarget(m_postprocessTargets[sourceIndex].bindGroup, m_postprocessTargets[shadowIndex].view,
-                        wgpu::LoadOp::Clear, m_maskImagePipeline, "RmlUi mask image pass", &m_blendMaskTarget.bindGroup,
-                        0, false);
-      CompositeToTarget(m_postprocessTargets[shadowIndex].bindGroup, m_postprocessTargets[sourceIndex].view,
-                        wgpu::LoadOp::Clear, m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)],
-                        "RmlUi mask image result copy pass");
+      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass",
+                        texture_bind_group_ref(m_blendMaskTarget.view), {}, false);
+      sourceIndex = scratchIndex;
       break;
     }
     }
   }
 
   EndActivePass();
+  return sourceIndex;
 }
 
-void WebGPURenderInterface::BeginFrame(const wgpu::CommandEncoder& encoder, const webgpu::TextureWithSampler& target,
-                                       const webgpu::TextureWithSampler& seedTarget) {
-  m_encoder = encoder;
-  m_frameSeedView = seedTarget.view;
+void WebGPURenderInterface::BeginFrame(const webgpu::TextureWithSampler& target,
+                                       const webgpu::TextureWithSampler& sceneTarget,
+                                       BaseLayerContent baseLayerContent) {
+  m_frameSeedView = sceneTarget.view;
   m_frameSize = target.size;
   m_viewport = {
       .left = 0.f,
@@ -1501,28 +1126,11 @@ void WebGPURenderInterface::BeginFrame(const wgpu::CommandEncoder& encoder, cons
   m_layerStack = {0};
   m_activeLayer = 0;
   m_frameRenderingStarted = false;
+  m_frameActive = true;
+  m_passActive = false;
+  m_baseLayerContent = baseLayerContent;
 
   NewFrame();
-  if (!m_pendingTextureUploads.empty()) {
-    for (const auto& upload : m_pendingTextureUploads) {
-      const wgpu::TexelCopyBufferInfo src{
-          .layout =
-              {
-                  .offset = 0,
-                  .bytesPerRow = upload.bytesPerRow,
-                  .rowsPerImage = upload.rowsPerImage,
-              },
-          .buffer = upload.buffer,
-      };
-      const wgpu::TexelCopyTextureInfo dstTexture{
-          .texture = upload.texture,
-          .aspect = wgpu::TextureAspect::All,
-      };
-      m_encoder.CopyBufferToTexture(&src, &dstTexture, &upload.size);
-      m_frameUploadBuffers.push_back(upload.buffer);
-    }
-    m_pendingTextureUploads.clear();
-  }
   EnsureFrameTargets(target.size);
   wgpu::Texture multisampleTexture;
   wgpu::TextureView multisampleView;
@@ -1548,7 +1156,6 @@ void WebGPURenderInterface::BeginFrame(const wgpu::CommandEncoder& encoder, cons
   m_layers[0] = {
       .texture = target.texture,
       .view = target.view,
-      .bindGroup = CreateImageBindGroup(target.view),
       .multisampleTexture = multisampleTexture,
       .multisampleView = multisampleView,
       .size = target.size,
@@ -1567,9 +1174,10 @@ bool WebGPURenderInterface::EndFrame() {
         .size = m_layers[0].size,
     };
   }
-  m_encoder = nullptr;
+  m_frameActive = false;
   m_frameSeedView = {};
   m_frameRenderingStarted = false;
+  m_baseLayerContent = BaseLayerContent::Transparent;
   return rendered;
 }
 
@@ -1596,17 +1204,53 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
   }
 
   EnsureFrameRenderingStarted();
-  CompositeToTarget(m_layers[source].bindGroup, m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
-                    m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)], "RmlUi layer copy pass");
   const Rml::LayerHandle topLayer = m_layerStack.empty() ? 0 : m_layerStack.back();
-  RenderFilters(filters);
+  const std::vector<Rml::CompiledFilterHandle> activeFilterHandles = active_filters(filters);
+  const Rml::Span activeFilters{activeFilterHandles.data(), activeFilterHandles.size()};
 
   const bool replace = blendMode == Rml::BlendMode::Replace;
   const BlitPipelineType pipelineType =
       replace ? (m_clipMaskEnabled ? BlitPipelineType::ReplaceMasked : BlitPipelineType::Replace)
               : (m_clipMaskEnabled ? BlitPipelineType::BlendMasked : BlitPipelineType::Blend);
+  if (activeFilters.empty() && source != destination) {
+    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer direct composite pass");
+    DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
+                          blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
+
+    if (destination != topLayer) {
+      EndActivePass();
+      m_activeLayer = topLayer;
+    }
+    return;
+  }
+
+  Rml::Matrix4f simpleFilterMatrix;
+  float simpleFilterOpacity = 1.f;
+  if (source != destination && try_fold_simple_filters(activeFilters, simpleFilterMatrix, simpleFilterOpacity)) {
+    const SimpleFilterUniformBlock simpleFilterUniform{
+        .matrix = to_shader_matrix(simpleFilterMatrix),
+        .opacity = {simpleFilterOpacity, 0.f, 0.f, 0.f},
+    };
+    const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
+    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi simple filter composite pass");
+    DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
+                          simple_filter_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true),
+                          uniform_bind_group_ref(), simpleFilterRange);
+
+    if (destination != topLayer) {
+      EndActivePass();
+      m_activeLayer = topLayer;
+    }
+    return;
+  }
+
+  CompositeToTarget(texture_bind_group_ref(m_layers[source].view), m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
+                    blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false), "RmlUi layer copy pass");
+  const size_t filteredIndex = RenderFilters(activeFilters);
+
   BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer composite pass");
-  DrawFullscreenTexture(m_postprocessTargets[0].bindGroup, m_layerBlitPipelines[static_cast<size_t>(pipelineType)]);
+  DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[filteredIndex].view),
+                        blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
 
   if (destination != topLayer) {
     EndActivePass();
@@ -1626,7 +1270,7 @@ void WebGPURenderInterface::PopLayer() {
 }
 
 Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
-  if (m_encoder == nullptr) {
+  if (!m_frameActive) {
     Log.warn("RmlUi requested SaveLayerAsTexture outside a frame");
     return 0;
   }
@@ -1669,6 +1313,9 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
   };
   texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
   texData->m_textureView = texData->m_texture.CreateView(nullptr);
+  texData->m_size = textureSize;
+  texData->m_rowBytes = textureSize.width * 4;
+  texData->m_uploaded = true;
 
   EndActivePass();
 
@@ -1685,20 +1332,7 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
       .texture = texData->m_texture,
       .aspect = wgpu::TextureAspect::All,
   };
-  m_encoder.CopyTextureToTexture(&src, &dst, &textureSize);
-
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = texData->m_textureView,
-      },
-  };
-  const wgpu::BindGroupDescriptor bindGroupDesc{
-      .layout = m_imageBindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
-  };
-  texData->m_bindGroup = webgpu::g_device.CreateBindGroup(&bindGroupDesc);
+  gfx::queue_texture_copy(src, dst, textureSize);
 
   BeginLayerPass(layer, wgpu::LoadOp::Load, "RmlUi saved layer restore pass");
   return reinterpret_cast<Rml::TextureHandle>(texData);
@@ -1709,7 +1343,7 @@ Rml::CompiledFilterHandle WebGPURenderInterface::SaveLayerAsMaskImage() {
     return {};
   }
 
-  if (m_encoder == nullptr) {
+  if (!m_frameActive) {
     Log.warn("RmlUi requested SaveLayerAsMaskImage outside a frame");
     return {};
   }
@@ -1722,10 +1356,12 @@ Rml::CompiledFilterHandle WebGPURenderInterface::SaveLayerAsMaskImage() {
 
   EnsureFrameRenderingStarted();
 
-  CompositeToTarget(m_layers[layer].bindGroup, m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
-                    m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)], "RmlUi mask source copy pass");
-  CompositeToTarget(m_postprocessTargets[0].bindGroup, m_blendMaskTarget.view, wgpu::LoadOp::Clear,
-                    m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)], "RmlUi mask image save pass");
+  CompositeToTarget(texture_bind_group_ref(m_layers[layer].view), m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
+                    blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
+                    "RmlUi mask source copy pass");
+  CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[0].view), m_blendMaskTarget.view, wgpu::LoadOp::Clear,
+                    blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
+                    "RmlUi mask image save pass");
 
   BeginLayerPass(layer, wgpu::LoadOp::Load, "RmlUi mask image restore pass");
 
@@ -1910,674 +1546,44 @@ void WebGPURenderInterface::RenderShader(Rml::CompiledShaderHandle shader, Rml::
     return;
   }
 
-  if (shader == 0 || geometry == 0) {
+  const auto* shaderData = reinterpret_cast<const CompiledShaderData*>(shader);
+  const auto* geometryData = reinterpret_cast<const ShaderGeometryData*>(geometry);
+  if (shaderData == nullptr || geometryData == nullptr) {
     return;
   }
   EnsureActiveLayerPass("RmlUi resumed shader layer pass");
-  if (m_pass == nullptr) {
+  if (!m_passActive) {
     return;
   }
 
-  SetupRenderState(translation);
-
-  const auto* shaderData = reinterpret_cast<const CompiledShaderData*>(shader);
-  const uint32_t shaderOffset = m_shaderUniformCurrentOffset;
-  m_shaderUniformCurrentOffset += AURORA_ALIGN(sizeof(GradientUniformBlock), 256);
-  webgpu::g_queue.WriteBuffer(m_shaderUniformBuffer, shaderOffset, &shaderData->gradient, sizeof(shaderData->gradient));
-
-  const auto* geometryData = reinterpret_cast<const ShaderGeometryData*>(geometry);
-  m_pass.SetVertexBuffer(0, geometryData->m_vertexBuffer, 0, geometryData->m_vertexBuffer.GetSize());
-  m_pass.SetIndexBuffer(geometryData->m_indexBuffer, wgpu::IndexFormat::Uint32, 0,
-                        geometryData->m_indexBuffer.GetSize());
-  m_pass.SetPipeline(m_gradientPipelines[m_clipMaskEnabled ? 1 : 0]);
-  m_pass.SetBindGroup(0, m_commonBindGroup, 1, &m_uniformCurrentOffset);
-  m_pass.SetBindGroup(1, m_shaderBindGroup, 1, &shaderOffset);
-  m_pass.DrawIndexed(geometryData->m_indexBuffer.GetSize() / sizeof(int));
-
-  m_uniformCurrentOffset += AURORA_ALIGN(sizeof(UniformBlock), 256);
+  const auto uniformRange = SetupRenderState(translation);
+  const auto shaderRange = gfx::push_uniform(shaderData->gradient);
+  const auto vertexRange =
+      gfx::push_verts(reinterpret_cast<const uint8_t*>(geometryData->vertices.data()),
+                      geometryData->vertices.size() * sizeof(Rml::Vertex), rmlBufferOffsetAlignment);
+  const auto indexRange = gfx::push_indices(reinterpret_cast<const uint8_t*>(geometryData->indices.data()),
+                                            geometryData->indices.size() * sizeof(uint32_t), rmlBufferOffsetAlignment);
+  gfx::push_draw_command(DrawData{
+      .pipeline = gradient_pipeline(m_renderTargetFormat, LayerSampleCount, m_clipMaskEnabled),
+      .vertexRange = vertexRange,
+      .indexRange = indexRange,
+      .uniformRange = uniformRange,
+      .bindGroup1 = uniform_bind_group_ref(),
+      .bindGroup1DynamicOffset = shaderRange.offset,
+      .dynamicBindGroupMask = 1u << 1u,
+      .drawKind = static_cast<uint32_t>(DrawKind::Geometry),
+      .indexCount = static_cast<uint32_t>(geometryData->indices.size()),
+      .stencilRef = m_stencilRef,
+      .blendConstant = {0.f, 0.f, 0.f, 0.f},
+      .hasBlendConstant = 1,
+  });
 }
 
 void WebGPURenderInterface::ReleaseShader(Rml::CompiledShaderHandle shader) {
   delete reinterpret_cast<CompiledShaderData*>(shader);
 }
 
-// code heavily based of imgui wgpu impl
 void WebGPURenderInterface::CreateDeviceObjects() {
-  constexpr std::array commonBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler =
-              {
-                  .type = wgpu::SamplerBindingType::Filtering,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor commonBindGroupLayoutDesc{
-      .entryCount = commonBindGroupLayoutEntries.size(),
-      .entries = commonBindGroupLayoutEntries.data(),
-  };
-  m_commonBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&commonBindGroupLayoutDesc);
-
-  constexpr std::array imageBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              {
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor imageBindGroupLayoutDesc{
-      .entryCount = imageBindGroupLayoutEntries.size(),
-      .entries = imageBindGroupLayoutEntries.data(),
-  };
-  m_imageBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&imageBindGroupLayoutDesc);
-
-  constexpr std::array blurBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor blurBindGroupLayoutDesc{
-      .entryCount = blurBindGroupLayoutEntries.size(),
-      .entries = blurBindGroupLayoutEntries.data(),
-  };
-  m_blurBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&blurBindGroupLayoutDesc);
-
-  constexpr std::array dropShadowBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor dropShadowBindGroupLayoutDesc{
-      .entryCount = dropShadowBindGroupLayoutEntries.size(),
-      .entries = dropShadowBindGroupLayoutEntries.data(),
-  };
-  m_dropShadowBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&dropShadowBindGroupLayoutDesc);
-
-  constexpr std::array shaderBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor shaderBindGroupLayoutDesc{
-      .entryCount = shaderBindGroupLayoutEntries.size(),
-      .entries = shaderBindGroupLayoutEntries.data(),
-  };
-  m_shaderBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&shaderBindGroupLayoutDesc);
-
-  const std::array layouts{m_commonBindGroupLayout, m_imageBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor layoutDesc{
-      .bindGroupLayoutCount = layouts.size(),
-      .bindGroupLayouts = layouts.data(),
-  };
-  m_pipelineLayout = webgpu::g_device.CreatePipelineLayout(&layoutDesc);
-
-  const std::array blurLayouts{m_commonBindGroupLayout, m_imageBindGroupLayout, m_blurBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor blurLayoutDesc{
-      .bindGroupLayoutCount = blurLayouts.size(),
-      .bindGroupLayouts = blurLayouts.data(),
-  };
-  m_blurPipelineLayout = webgpu::g_device.CreatePipelineLayout(&blurLayoutDesc);
-
-  const std::array dropShadowLayouts{m_commonBindGroupLayout, m_imageBindGroupLayout, m_dropShadowBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor dropShadowLayoutDesc{
-      .bindGroupLayoutCount = dropShadowLayouts.size(),
-      .bindGroupLayouts = dropShadowLayouts.data(),
-  };
-  m_dropShadowPipelineLayout = webgpu::g_device.CreatePipelineLayout(&dropShadowLayoutDesc);
-
-  const std::array colorMatrixLayouts{m_commonBindGroupLayout, m_imageBindGroupLayout, m_shaderBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor colorMatrixLayoutDesc{
-      .bindGroupLayoutCount = colorMatrixLayouts.size(),
-      .bindGroupLayouts = colorMatrixLayouts.data(),
-  };
-  m_colorMatrixPipelineLayout = webgpu::g_device.CreatePipelineLayout(&colorMatrixLayoutDesc);
-
-  const std::array maskImageLayouts{m_commonBindGroupLayout, m_imageBindGroupLayout, m_imageBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor maskImageLayoutDesc{
-      .bindGroupLayoutCount = maskImageLayouts.size(),
-      .bindGroupLayouts = maskImageLayouts.data(),
-  };
-  m_maskImagePipelineLayout = webgpu::g_device.CreatePipelineLayout(&maskImageLayoutDesc);
-
-  const std::array shaderLayouts{m_commonBindGroupLayout, m_shaderBindGroupLayout};
-  const wgpu::PipelineLayoutDescriptor shaderLayoutDesc{
-      .bindGroupLayoutCount = shaderLayouts.size(),
-      .bindGroupLayouts = shaderLayouts.data(),
-  };
-  m_shaderPipelineLayout = webgpu::g_device.CreatePipelineLayout(&shaderLayoutDesc);
-
-  const auto vertexShader = compile_shader(vertexSource, "RmlUi Vertex Shader");
-  const auto fragmentShader = compile_shader(fragmentSource, "RmlUi Fragment Shader");
-  const auto gradientFragmentShader = compile_shader(gradientFragmentSource, "RmlUi Gradient Fragment Shader");
-  const auto fullscreenVertexShader = compile_shader(fullscreenVertexSource, "RmlUi Fullscreen Vertex Shader");
-  const auto blurVertexShader = compile_shader(blurVertexSource, "RmlUi Blur Vertex Shader");
-  const auto blitFragmentShader = compile_shader(blitFragmentSource, "RmlUi Blit Fragment Shader");
-  const auto opaqueBlitFragmentShader = compile_shader(opaqueBlitFragmentSource, "RmlUi Opaque Blit Fragment Shader");
-  const auto colorMatrixFragmentShader =
-      compile_shader(colorMatrixFragmentSource, "RmlUi Color Matrix Fragment Shader");
-  const auto maskImageFragmentShader = compile_shader(maskImageFragmentSource, "RmlUi Mask Image Fragment Shader");
-  const auto blurFragmentShader = compile_shader(blurFragmentSource, "RmlUi Blur Fragment Shader");
-  const auto regionBlitFragmentShader = compile_shader(regionBlitFragmentSource, "RmlUi Region Blit Fragment Shader");
-  const auto dropShadowFragmentShader = compile_shader(dropShadowFragmentSource, "RmlUi Drop Shadow Fragment Shader");
-  constexpr std::array vertexAttributes{
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = offsetof(Rml::Vertex, position),
-          .shaderLocation = 0,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = offsetof(Rml::Vertex, tex_coord),
-          .shaderLocation = 1,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Unorm8x4,
-          .offset = offsetof(Rml::Vertex, colour),
-          .shaderLocation = 2,
-      },
-  };
-  const std::array vertexBufferLayouts{
-      wgpu::VertexBufferLayout{
-          .stepMode = wgpu::VertexStepMode::Vertex,
-          .arrayStride = sizeof(Rml::Vertex),
-          .attributeCount = vertexAttributes.size(),
-          .attributes = vertexAttributes.data(),
-      },
-  };
-  constexpr wgpu::BlendState premultipliedBlendState{
-      .color =
-          {
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::One,
-              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
-          },
-      .alpha =
-          {
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::One,
-              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
-          },
-  };
-  constexpr wgpu::BlendState opacityBlendState{
-      .color =
-          {
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
-          },
-      .alpha =
-          {
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
-          },
-  };
-
-  const auto create_pipeline = [&](const char* label, wgpu::CompareFunction compareFn,
-                                   wgpu::StencilOperation stencilPass, wgpu::ColorWriteMask colorWriteMask) {
-    const wgpu::ColorTargetState colorState{
-        .format = m_renderTargetFormat,
-        .blend = &premultipliedBlendState,
-        .writeMask = colorWriteMask,
-    };
-    const wgpu::FragmentState fragmentState{
-        .module = fragmentShader.module,
-        .entryPoint = fragmentShader.entryPoint,
-        .targetCount = 1,
-        .targets = &colorState,
-    };
-    const auto stencilFace = stencil_face(compareFn, stencilPass);
-    const wgpu::DepthStencilState depthStencilState{
-        .format = ClipMaskStencilFormat,
-        .stencilFront = stencilFace,
-        .stencilBack = stencilFace,
-        .stencilReadMask = 0xFF,
-        .stencilWriteMask = 0xFF,
-    };
-    const wgpu::DepthStencilState* depthStencilStatePtr = EnableClipMaskStencil ? &depthStencilState : nullptr;
-    const wgpu::RenderPipelineDescriptor pipelineDesc{
-        .label = label,
-        .layout = m_pipelineLayout,
-        .vertex =
-            {
-                .module = vertexShader.module,
-                .entryPoint = vertexShader.entryPoint,
-                .bufferCount = vertexBufferLayouts.size(),
-                .buffers = vertexBufferLayouts.data(),
-            },
-        .primitive =
-            {
-                .topology = wgpu::PrimitiveTopology::TriangleList,
-                .stripIndexFormat = wgpu::IndexFormat::Undefined,
-                .frontFace = wgpu::FrontFace::CW,
-                .cullMode = wgpu::CullMode::None,
-            },
-        .depthStencil = depthStencilStatePtr,
-        .multisample =
-            {
-                .count = LayerSampleCount,
-            },
-        .fragment = &fragmentState,
-    };
-    return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
-  };
-
-  m_pipelines[static_cast<size_t>(PipelineType::Normal)] = create_pipeline(
-      "RmlUi Pipeline", wgpu::CompareFunction::Always, wgpu::StencilOperation::Keep, wgpu::ColorWriteMask::All);
-  m_pipelines[static_cast<size_t>(PipelineType::Masked)] = create_pipeline(
-      "RmlUi Masked Pipeline", wgpu::CompareFunction::Equal, wgpu::StencilOperation::Keep, wgpu::ColorWriteMask::All);
-  m_pipelines[static_cast<size_t>(PipelineType::ClipReplace)] =
-      create_pipeline("RmlUi Clip Replace Pipeline", wgpu::CompareFunction::Always, wgpu::StencilOperation::Replace,
-                      wgpu::ColorWriteMask::None);
-  m_pipelines[static_cast<size_t>(PipelineType::ClipIntersect)] =
-      create_pipeline("RmlUi Clip Intersect Pipeline", wgpu::CompareFunction::Equal,
-                      wgpu::StencilOperation::IncrementClamp, wgpu::ColorWriteMask::None);
-
-  const auto create_gradient_pipeline = [&](const char* label, wgpu::CompareFunction compareFn) {
-    const wgpu::ColorTargetState colorState{
-        .format = m_renderTargetFormat,
-        .blend = &premultipliedBlendState,
-        .writeMask = wgpu::ColorWriteMask::All,
-    };
-    const wgpu::FragmentState fragmentState{
-        .module = gradientFragmentShader.module,
-        .entryPoint = gradientFragmentShader.entryPoint,
-        .targetCount = 1,
-        .targets = &colorState,
-    };
-    const auto stencilFace = stencil_face(compareFn, wgpu::StencilOperation::Keep);
-    const wgpu::DepthStencilState depthStencilState{
-        .format = ClipMaskStencilFormat,
-        .stencilFront = stencilFace,
-        .stencilBack = stencilFace,
-        .stencilReadMask = 0xFF,
-        .stencilWriteMask = 0xFF,
-    };
-    const wgpu::DepthStencilState* depthStencilStatePtr = EnableClipMaskStencil ? &depthStencilState : nullptr;
-    const wgpu::RenderPipelineDescriptor pipelineDesc{
-        .label = label,
-        .layout = m_shaderPipelineLayout,
-        .vertex =
-            {
-                .module = vertexShader.module,
-                .entryPoint = vertexShader.entryPoint,
-                .bufferCount = vertexBufferLayouts.size(),
-                .buffers = vertexBufferLayouts.data(),
-            },
-        .primitive =
-            {
-                .topology = wgpu::PrimitiveTopology::TriangleList,
-                .stripIndexFormat = wgpu::IndexFormat::Undefined,
-                .frontFace = wgpu::FrontFace::CW,
-                .cullMode = wgpu::CullMode::None,
-            },
-        .depthStencil = depthStencilStatePtr,
-        .multisample =
-            {
-                .count = LayerSampleCount,
-            },
-        .fragment = &fragmentState,
-    };
-    return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
-  };
-
-  m_gradientPipelines[0] = create_gradient_pipeline("RmlUi Gradient Pipeline", wgpu::CompareFunction::Always);
-  m_gradientPipelines[1] = create_gradient_pipeline("RmlUi Masked Gradient Pipeline", wgpu::CompareFunction::Equal);
-
-  const auto create_blit_pipeline = [&](const char* label, const wgpu::ComputeState& blitShader,
-                                        wgpu::CompareFunction compareFn, bool blend, uint32_t sampleCount,
-                                        bool useStencil) {
-    const wgpu::ColorTargetState colorState{
-        .format = m_renderTargetFormat,
-        .blend = blend ? &premultipliedBlendState : nullptr,
-        .writeMask = wgpu::ColorWriteMask::All,
-    };
-    const wgpu::FragmentState fragmentState{
-        .module = blitShader.module,
-        .entryPoint = blitShader.entryPoint,
-        .targetCount = 1,
-        .targets = &colorState,
-    };
-    const auto stencilFace = stencil_face(compareFn, wgpu::StencilOperation::Keep);
-    const wgpu::DepthStencilState depthStencilState{
-        .format = ClipMaskStencilFormat,
-        .stencilFront = stencilFace,
-        .stencilBack = stencilFace,
-        .stencilReadMask = 0xFF,
-        .stencilWriteMask = 0xFF,
-    };
-    const wgpu::DepthStencilState* depthStencilStatePtr =
-        EnableClipMaskStencil && useStencil ? &depthStencilState : nullptr;
-    const wgpu::RenderPipelineDescriptor pipelineDesc{
-        .label = label,
-        .layout = m_pipelineLayout,
-        .vertex =
-            {
-                .module = fullscreenVertexShader.module,
-                .entryPoint = fullscreenVertexShader.entryPoint,
-            },
-        .primitive =
-            {
-                .topology = wgpu::PrimitiveTopology::TriangleList,
-            },
-        .depthStencil = depthStencilStatePtr,
-        .multisample =
-            {
-                .count = sampleCount,
-            },
-        .fragment = &fragmentState,
-    };
-    return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
-  };
-
-  m_blitPipelines[static_cast<size_t>(BlitPipelineType::Blend)] = create_blit_pipeline(
-      "RmlUi Blit Blend Pipeline", blitFragmentShader, wgpu::CompareFunction::Always, true, 1, false);
-  m_blitPipelines[static_cast<size_t>(BlitPipelineType::BlendMasked)] = create_blit_pipeline(
-      "RmlUi Blit Blend Masked Pipeline", blitFragmentShader, wgpu::CompareFunction::Equal, true, 1, false);
-  m_blitPipelines[static_cast<size_t>(BlitPipelineType::Replace)] = create_blit_pipeline(
-      "RmlUi Blit Replace Pipeline", blitFragmentShader, wgpu::CompareFunction::Always, false, 1, false);
-  m_blitPipelines[static_cast<size_t>(BlitPipelineType::ReplaceMasked)] = create_blit_pipeline(
-      "RmlUi Blit Replace Masked Pipeline", blitFragmentShader, wgpu::CompareFunction::Equal, false, 1, false);
-  m_layerBlitPipelines[static_cast<size_t>(BlitPipelineType::Blend)] =
-      create_blit_pipeline("RmlUi Layer Blit Blend Pipeline", blitFragmentShader, wgpu::CompareFunction::Always, true,
-                           LayerSampleCount, true);
-  m_layerBlitPipelines[static_cast<size_t>(BlitPipelineType::BlendMasked)] =
-      create_blit_pipeline("RmlUi Layer Blit Blend Masked Pipeline", blitFragmentShader, wgpu::CompareFunction::Equal,
-                           true, LayerSampleCount, true);
-  m_layerBlitPipelines[static_cast<size_t>(BlitPipelineType::Replace)] =
-      create_blit_pipeline("RmlUi Layer Blit Replace Pipeline", blitFragmentShader, wgpu::CompareFunction::Always,
-                           false, LayerSampleCount, true);
-  m_layerBlitPipelines[static_cast<size_t>(BlitPipelineType::ReplaceMasked)] =
-      create_blit_pipeline("RmlUi Layer Blit Replace Masked Pipeline", blitFragmentShader, wgpu::CompareFunction::Equal,
-                           false, LayerSampleCount, true);
-  m_opaqueBlitPipeline = create_blit_pipeline("RmlUi Opaque Blit Pipeline", opaqueBlitFragmentShader,
-                                              wgpu::CompareFunction::Always, false, 1, false);
-  m_layerOpaqueBlitPipeline = create_blit_pipeline("RmlUi Layer Opaque Blit Pipeline", opaqueBlitFragmentShader,
-                                                   wgpu::CompareFunction::Always, false, LayerSampleCount, true);
-
-  const wgpu::ColorTargetState opacityColorState{
-      .format = m_renderTargetFormat,
-      .blend = &opacityBlendState,
-      .writeMask = wgpu::ColorWriteMask::All,
-  };
-  const wgpu::FragmentState opacityFragmentState{
-      .module = blitFragmentShader.module,
-      .entryPoint = blitFragmentShader.entryPoint,
-      .targetCount = 1,
-      .targets = &opacityColorState,
-  };
-  const wgpu::RenderPipelineDescriptor opacityPipelineDesc{
-      .label = "RmlUi Opacity Pipeline",
-      .layout = m_pipelineLayout,
-      .vertex =
-          {
-              .module = fullscreenVertexShader.module,
-              .entryPoint = fullscreenVertexShader.entryPoint,
-          },
-      .primitive =
-          {
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = nullptr,
-      .multisample =
-          {
-              .count = 1,
-          },
-      .fragment = &opacityFragmentState,
-  };
-  m_opacityPipeline = webgpu::g_device.CreateRenderPipeline(&opacityPipelineDesc);
-
-  const wgpu::ColorTargetState blurColorState{
-      .format = m_renderTargetFormat,
-      .writeMask = wgpu::ColorWriteMask::All,
-  };
-  const wgpu::FragmentState blurFragmentState{
-      .module = blurFragmentShader.module,
-      .entryPoint = blurFragmentShader.entryPoint,
-      .targetCount = 1,
-      .targets = &blurColorState,
-  };
-  const auto create_filter_pipeline = [&](const char* label, const wgpu::PipelineLayout& layout,
-                                          const wgpu::ComputeState& fragmentShader) {
-    const wgpu::FragmentState fragmentState{
-        .module = fragmentShader.module,
-        .entryPoint = fragmentShader.entryPoint,
-        .targetCount = 1,
-        .targets = &blurColorState,
-    };
-    const wgpu::RenderPipelineDescriptor pipelineDesc{
-        .label = label,
-        .layout = layout,
-        .vertex =
-            {
-                .module = fullscreenVertexShader.module,
-                .entryPoint = fullscreenVertexShader.entryPoint,
-            },
-        .primitive =
-            {
-                .topology = wgpu::PrimitiveTopology::TriangleList,
-            },
-        .depthStencil = nullptr,
-        .multisample =
-            {
-                .count = 1,
-            },
-        .fragment = &fragmentState,
-    };
-    return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
-  };
-
-  m_colorMatrixPipeline =
-      create_filter_pipeline("RmlUi Color Matrix Pipeline", m_colorMatrixPipelineLayout, colorMatrixFragmentShader);
-  m_maskImagePipeline =
-      create_filter_pipeline("RmlUi Mask Image Pipeline", m_maskImagePipelineLayout, maskImageFragmentShader);
-
-  const wgpu::RenderPipelineDescriptor blurPipelineDesc{
-      .label = "RmlUi Blur Pipeline",
-      .layout = m_blurPipelineLayout,
-      .vertex =
-          {
-              .module = blurVertexShader.module,
-              .entryPoint = blurVertexShader.entryPoint,
-          },
-      .primitive =
-          {
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = nullptr,
-      .multisample =
-          {
-              .count = 1,
-          },
-      .fragment = &blurFragmentState,
-  };
-  m_blurPipeline = webgpu::g_device.CreateRenderPipeline(&blurPipelineDesc);
-
-  const wgpu::FragmentState regionBlitFragmentState{
-      .module = regionBlitFragmentShader.module,
-      .entryPoint = regionBlitFragmentShader.entryPoint,
-      .targetCount = 1,
-      .targets = &blurColorState,
-  };
-  const wgpu::RenderPipelineDescriptor regionBlitPipelineDesc{
-      .label = "RmlUi Region Blit Pipeline",
-      .layout = m_blurPipelineLayout,
-      .vertex =
-          {
-              .module = fullscreenVertexShader.module,
-              .entryPoint = fullscreenVertexShader.entryPoint,
-          },
-      .primitive =
-          {
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = nullptr,
-      .multisample =
-          {
-              .count = 1,
-          },
-      .fragment = &regionBlitFragmentState,
-  };
-  m_regionBlitPipeline = webgpu::g_device.CreateRenderPipeline(&regionBlitPipelineDesc);
-
-  const wgpu::ColorTargetState dropShadowColorState{
-      .format = m_renderTargetFormat,
-      .writeMask = wgpu::ColorWriteMask::All,
-  };
-  const wgpu::FragmentState dropShadowFragmentState{
-      .module = dropShadowFragmentShader.module,
-      .entryPoint = dropShadowFragmentShader.entryPoint,
-      .targetCount = 1,
-      .targets = &dropShadowColorState,
-  };
-  const wgpu::RenderPipelineDescriptor dropShadowPipelineDesc{
-      .label = "RmlUi Drop Shadow Pipeline",
-      .layout = m_dropShadowPipelineLayout,
-      .vertex =
-          {
-              .module = fullscreenVertexShader.module,
-              .entryPoint = fullscreenVertexShader.entryPoint,
-          },
-      .primitive =
-          {
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = nullptr,
-      .multisample =
-          {
-              .count = 1,
-          },
-      .fragment = &dropShadowFragmentState,
-  };
-  m_dropShadowPipeline = webgpu::g_device.CreateRenderPipeline(&dropShadowPipelineDesc);
-
-  const wgpu::SamplerDescriptor samplerDesc{
-      .addressModeU = wgpu::AddressMode::Repeat,
-      .addressModeV = wgpu::AddressMode::Repeat,
-      .addressModeW = wgpu::AddressMode::Repeat,
-      .magFilter = wgpu::FilterMode::Linear,
-      .minFilter = wgpu::FilterMode::Linear,
-      .mipmapFilter = wgpu::MipmapFilterMode::Linear,
-      .maxAnisotropy = 1,
-  };
-  m_sampler = webgpu::g_device.CreateSampler(&samplerDesc);
-
-  CreateUniformBuffer();
-  const wgpu::BufferDescriptor blurUniformBufferDesc{
-      .label = "RmlUi Blur Uniform Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform,
-      .size = AURORA_ALIGN(UniformBufferSize, 16),
-  };
-  m_blurUniformBuffer = webgpu::g_device.CreateBuffer(&blurUniformBufferDesc);
-  const wgpu::BufferDescriptor dropShadowUniformBufferDesc{
-      .label = "RmlUi Drop Shadow Uniform Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform,
-      .size = AURORA_ALIGN(UniformBufferSize, 16),
-  };
-  m_dropShadowUniformBuffer = webgpu::g_device.CreateBuffer(&dropShadowUniformBufferDesc);
-  const wgpu::BufferDescriptor shaderUniformBufferDesc{
-      .label = "RmlUi Shader Uniform Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform,
-      .size = AURORA_ALIGN(UniformBufferSize, 16),
-  };
-  m_shaderUniformBuffer = webgpu::g_device.CreateBuffer(&shaderUniformBufferDesc);
-
-  const std::array commonBindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = m_uniformBuffer,
-          .offset = 0,
-          .size = AURORA_ALIGN(sizeof(UniformBlock), 16),
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .sampler = m_sampler,
-      },
-  };
-  const wgpu::BindGroupDescriptor commonBindGroupDescriptor{
-      .layout = m_commonBindGroupLayout,
-      .entryCount = commonBindGroupEntries.size(),
-      .entries = commonBindGroupEntries.data(),
-  };
-  m_commonBindGroup = webgpu::g_device.CreateBindGroup(&commonBindGroupDescriptor);
-
-  const std::array blurBindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = m_blurUniformBuffer,
-          .offset = 0,
-          .size = AURORA_ALIGN(sizeof(BlurUniformBlock), 16),
-      },
-  };
-  const wgpu::BindGroupDescriptor blurBindGroupDescriptor{
-      .layout = m_blurBindGroupLayout,
-      .entryCount = blurBindGroupEntries.size(),
-      .entries = blurBindGroupEntries.data(),
-  };
-  m_blurBindGroup = webgpu::g_device.CreateBindGroup(&blurBindGroupDescriptor);
-
-  const std::array dropShadowBindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = m_dropShadowUniformBuffer,
-          .offset = 0,
-          .size = AURORA_ALIGN(sizeof(DropShadowUniformBlock), 16),
-      },
-  };
-  const wgpu::BindGroupDescriptor dropShadowBindGroupDescriptor{
-      .layout = m_dropShadowBindGroupLayout,
-      .entryCount = dropShadowBindGroupEntries.size(),
-      .entries = dropShadowBindGroupEntries.data(),
-  };
-  m_dropShadowBindGroup = webgpu::g_device.CreateBindGroup(&dropShadowBindGroupDescriptor);
-
-  const std::array shaderBindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = m_shaderUniformBuffer,
-          .offset = 0,
-          .size = AURORA_ALIGN(sizeof(GradientUniformBlock), 16),
-      },
-  };
-  const wgpu::BindGroupDescriptor shaderBindGroupDescriptor{
-      .layout = m_shaderBindGroupLayout,
-      .entryCount = shaderBindGroupEntries.size(),
-      .entries = shaderBindGroupEntries.data(),
-  };
-  m_shaderBindGroup = webgpu::g_device.CreateBindGroup(&shaderBindGroupDescriptor);
-
   switch (m_renderTargetFormat) {
   case wgpu::TextureFormat::ASTC10x10UnormSrgb:
   case wgpu::TextureFormat::ASTC10x5UnormSrgb:
@@ -2610,11 +1616,11 @@ void WebGPURenderInterface::CreateDeviceObjects() {
   CreateNullTexture();
 }
 
-void WebGPURenderInterface::SetupRenderState(const Rml::Vector2f& translation) {
+gfx::Range WebGPURenderInterface::SetupRenderState(const Rml::Vector2f& translation) {
   const float L = 0.f;
-  const float R = static_cast<float>(m_windowSize.x);
+  const float R = static_cast<float>(std::max(m_windowSize.x, 1));
   const float T = 0.f;
-  const float B = static_cast<float>(m_windowSize.y);
+  const float B = static_cast<float>(std::max(m_windowSize.y, 1));
   const float near = -10000.f;
   const float far = 10000.f;
 
@@ -2627,38 +1633,7 @@ void WebGPURenderInterface::SetupRenderState(const Rml::Vector2f& translation) {
       .translation = {translation.x, translation.y, 0.0f, 1.0f},
       .Gamma = m_gamma,
   };
-#ifdef AURORA_PLATFORM_SWITCH
-  wgpu::Buffer uniformBuffer =
-      create_mapped_buffer("RmlUi Draw Uniform Buffer", wgpu::BufferUsage::Uniform, &ubo, sizeof(ubo));
-  const std::array commonBindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = uniformBuffer,
-          .offset = 0,
-          .size = AURORA_ALIGN(sizeof(UniformBlock), 16),
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .sampler = m_sampler,
-      },
-  };
-  const wgpu::BindGroupDescriptor commonBindGroupDescriptor{
-      .layout = m_commonBindGroupLayout,
-      .entryCount = commonBindGroupEntries.size(),
-      .entries = commonBindGroupEntries.data(),
-  };
-  m_frameUploadBuffers.push_back(uniformBuffer);
-  m_frameBindGroups.push_back(webgpu::g_device.CreateBindGroup(&commonBindGroupDescriptor));
-  m_drawCommonBindGroup = m_frameBindGroups.back();
-  m_drawUniformOffset = 0;
-#else
-  webgpu::g_queue.WriteBuffer(m_uniformBuffer, m_uniformCurrentOffset, &ubo, sizeof(UniformBlock));
-  m_drawCommonBindGroup = m_commonBindGroup;
-  m_drawUniformOffset = m_uniformCurrentOffset;
-#endif
-
-  constexpr wgpu::Color BlendColor{0.f, 0.f, 0.f, 0.f};
-  m_pass.SetBlendConstant(&BlendColor);
+  return gfx::push_uniform(ubo);
 }
 
 void WebGPURenderInterface::CreateNullTexture() {
@@ -2692,24 +1667,7 @@ void WebGPURenderInterface::EnsureClipResetGeometry() {
   m_clipResetGeometrySize = m_windowSize;
 }
 
-void WebGPURenderInterface::CreateUniformBuffer() {
-  constexpr wgpu::BufferDescriptor bufferDesc{
-      .label = "RmlUi Uniform Buffer",
-      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform,
-      .size = AURORA_ALIGN(UniformBufferSize, 16),
-  };
-  m_uniformBuffer = webgpu::g_device.CreateBuffer(&bufferDesc);
-}
-
 void WebGPURenderInterface::NewFrame() {
-  m_frameUploadBuffers.clear();
-  m_frameBindGroups.clear();
-  m_drawCommonBindGroup = nullptr;
-  m_drawUniformOffset = 0;
-  m_uniformCurrentOffset = 0;
-  m_blurUniformCurrentOffset = 0;
-  m_dropShadowUniformCurrentOffset = 0;
-  m_shaderUniformCurrentOffset = 0;
   m_clipMaskEnabled = false;
   m_stencilRef = 0;
 }

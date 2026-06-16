@@ -1,4 +1,6 @@
 set(_aurora_core_platform_sources
+        lib/device.cpp
+        lib/device.hpp
         lib/input.cpp
         lib/window.cpp
 )
@@ -13,6 +15,8 @@ add_library(aurora_core STATIC
         lib/aurora.cpp
         ${_aurora_core_platform_sources}
         lib/logging.cpp
+        lib/system_info.cpp
+        lib/system_info.hpp
 )
 add_library(aurora::core ALIAS aurora_core)
 set_target_properties(aurora_core PROPERTIES FOLDER "aurora")
@@ -31,7 +35,21 @@ if (AURORA_ENABLE_GX AND AURORA_ENABLE_GPU_CACHE)
 endif ()
 if (AURORA_ENABLE_GX AND AURORA_ENABLE_GPU_CACHE AND AURORA_CACHE_USE_ZSTD)
     target_compile_definitions(aurora_core PRIVATE AURORA_CACHE_USE_ZSTD)
-    target_link_libraries(aurora_core PRIVATE libzstd_static)
+    target_link_libraries(aurora_core PRIVATE zstd::libzstd)
+endif ()
+
+if (CMAKE_SYSTEM_NAME STREQUAL Windows)
+    # stuff for fetching system info.
+    target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
+elseif (APPLE)
+    target_sources(aurora_core PRIVATE lib/system_info_mac.mm)
+endif ()
+
+if (IOS)
+    find_library(COREHAPTICS_FRAMEWORK CoreHaptics REQUIRED)
+    target_sources(aurora_core PRIVATE lib/device_ios.mm)
+    set_source_files_properties(lib/device_ios.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+    target_link_libraries(aurora_core PUBLIC ${COREHAPTICS_FRAMEWORK})
 endif ()
 
 if (AURORA_ENABLE_GX AND AURORA_ENABLE_IMGUI)
@@ -45,6 +63,7 @@ if(AURORA_ENABLE_RMLUI)
 
     target_sources(aurora_core PRIVATE
             lib/rmlui.cpp
+            lib/rmlui/RuntimeTextureProvider.cpp
             lib/rmlui/RmlUi_Backend_Aurora.cpp
             lib/rmlui/WebGPURenderInterface.cpp
             lib/rmlui/SystemInterface_Aurora.cpp
@@ -72,7 +91,16 @@ if (AURORA_ENABLE_GX)
     else ()
         set(_aurora_gpu_cache_source lib/webgpu/gpu_cache_null.cpp)
     endif ()
-    target_sources(aurora_core PRIVATE lib/webgpu/gpu.cpp ${_aurora_gpu_cache_source} lib/dawn/BackendBinding.cpp)
+    target_sources(aurora_core PRIVATE
+            lib/webgpu/gpu.cpp
+            ${_aurora_gpu_cache_source}
+            lib/webgpu/gpu_prof.cpp
+            lib/dawn/BackendBinding.cpp
+            lib/dawn/TracyPlatform.cpp
+    )
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+        set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
+    endif ()
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
     if (AURORA_PLATFORM_SWITCH)
         set(DAWN_SWITCH_NVK_ROOT "/opt/nvk-switch" CACHE PATH
@@ -115,6 +143,7 @@ if (AURORA_ENABLE_GX)
         target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_METAL)
         target_sources(aurora_core PRIVATE lib/dawn/MetalBinding.mm)
         set_source_files_properties(lib/dawn/MetalBinding.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+        target_link_options(aurora_core PUBLIC "LINKER:-weak_framework,Metal")
     endif ()
     if (DAWN_ENABLE_D3D11)
         target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_D3D11)
