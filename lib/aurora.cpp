@@ -45,6 +45,23 @@ const char* SDL_GetError() {
 using webgpu::g_device;
 using webgpu::g_queue;
 using webgpu::g_surface;
+
+uint32_t clamp_scissor_coord(double value, uint32_t maximum) noexcept {
+  if (!std::isfinite(value)) {
+    return 0;
+  }
+  return static_cast<uint32_t>(std::clamp(value, 0.0, static_cast<double>(maximum)));
+}
+
+void set_present_viewport(const wgpu::RenderPassEncoder& pass, const gfx::Viewport& viewport, uint32_t surfaceWidth,
+                          uint32_t surfaceHeight) noexcept {
+  pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height, viewport.znear, viewport.zfar);
+  const auto scissorX = clamp_scissor_coord(std::floor(viewport.left), surfaceWidth);
+  const auto scissorY = clamp_scissor_coord(std::floor(viewport.top), surfaceHeight);
+  const auto scissorRight = clamp_scissor_coord(std::ceil(viewport.left + viewport.width), surfaceWidth);
+  const auto scissorBottom = clamp_scissor_coord(std::ceil(viewport.top + viewport.height), surfaceHeight);
+  pass.SetScissorRect(scissorX, scissorY, scissorRight - scissorX, scissorBottom - scissorY);
+}
 #endif
 
 #ifdef AURORA_ENABLE_GX
@@ -322,7 +339,8 @@ void end_frame() noexcept {
         // Copy EFB -> XFB (swapchain)
         pass.SetPipeline(webgpu::g_CopyPipeline);
         pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-        pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height, viewport.znear, viewport.zfar);
+        set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
+                             webgpu::g_graphicsConfig.surfaceConfiguration.height);
 
         pass.Draw(3);
         if (rmlBindGroup && rmlOverlay) {
@@ -390,7 +408,7 @@ void end_frame() noexcept {
       case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
       case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
         Log.info("Surface texture is {}, reconfiguring swapchain", magic_enum::enum_name(surfaceStatus));
-        webgpu::refresh_surface(false);
+        window::push_custom_event(window::CustomEvent::RefreshSurface);
         break;
       case wgpu::SurfaceGetCurrentTextureStatus::Lost:
         Log.warn("Surface texture is {}, releasing surface", magic_enum::enum_name(surfaceStatus));
