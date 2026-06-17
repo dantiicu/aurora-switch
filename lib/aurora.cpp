@@ -168,11 +168,13 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
 
+#ifdef AURORA_ENABLE_IMGUI
   imgui::create_context();
+#endif
 #endif
   const auto size = window::get_window_size();
   Log.info("Using framebuffer size {}x{} scale {}", size.fb_width, size.fb_height, size.scale);
-#ifdef AURORA_ENABLE_GX
+#ifdef AURORA_ENABLE_IMGUI
   if (g_config.imGuiInitCallback != nullptr) {
     g_config.imGuiInitCallback(&size);
   }
@@ -200,7 +202,9 @@ void shutdown() noexcept {
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown();
 #endif
+#ifdef AURORA_ENABLE_IMGUI
   imgui::shutdown();
+#endif
   gfx::shutdown();
   webgpu::shutdown();
 #endif
@@ -236,7 +240,9 @@ bool begin_frame() noexcept {
     }
   }
 
+#ifdef AURORA_ENABLE_IMGUI
   imgui::new_frame(window::get_window_size());
+#endif
   if (!gfx::begin_frame()) {
     return false;
   }
@@ -249,7 +255,11 @@ void end_frame() noexcept {
 #ifdef AURORA_ENABLE_GX
   gx::fifo::drain();
   gfx::finish();
+#ifdef AURORA_ENABLE_IMGUI
   auto imguiDrawData = imgui::freeze();
+#else
+  imgui::DrawData imguiDrawData;
+#endif
 
   const auto& presentSource = webgpu::present_source();
   const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -322,7 +332,7 @@ void end_frame() noexcept {
         }
         pass.End();
       }
-#if !defined(AURORA_PLATFORM_SWITCH)
+#if defined(AURORA_ENABLE_IMGUI) && !defined(AURORA_PLATFORM_SWITCH)
       {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{

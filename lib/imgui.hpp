@@ -5,7 +5,7 @@
 #include <memory>
 #include <utility>
 
-union SDL_Event;
+struct SDL_Event;
 
 namespace wgpu {
 class RenderPassEncoder;

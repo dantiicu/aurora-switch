@@ -55,6 +55,15 @@ if (AURORA_ENABLE_GPU_CACHE)
 endif ()
 if (NOT AURORA_PLATFORM_SWITCH)
     target_link_libraries(aurora_gx PRIVATE PNG::PNG)
+else ()
+    # png_io.cpp needs libpng; on Switch it comes from devkitPro portlibs.
+    find_library(AURORA_SWITCH_PNG_LIBRARY NAMES png png16
+            PATHS "$ENV{DEVKITPRO}/portlibs/switch/lib"
+            NO_DEFAULT_PATH)
+    if (NOT AURORA_SWITCH_PNG_LIBRARY)
+        message(FATAL_ERROR "aurora: Missing Switch libpng dependency")
+    endif ()
+    target_link_libraries(aurora_gx PRIVATE ${AURORA_SWITCH_PNG_LIBRARY} z)
 endif ()
 target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
 

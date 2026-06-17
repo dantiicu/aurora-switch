@@ -3,6 +3,11 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(simple PRIVATE aurora::core aurora::gx aurora::main aurora::vi)
 
   if (AURORA_PLATFORM_SWITCH)
+    # The Switch SDL3 shim (include/SDL3/SDL.h), pulled in transitively via
+    # <aurora/event.h>, is C++-only. Build the example as C++ so it can consume it;
+    # the aurora/dolphin headers are extern "C", so linkage is unaffected.
+    set_source_files_properties(simple.c PROPERTIES LANGUAGE CXX)
+
     set(DAWN_SWITCH_NVK_ROOT "/opt/nvk-switch" CACHE PATH
       "Mesa/NVK Switch install root")
     set(DAWN_SWITCH_NVK_LIBRARY "${DAWN_SWITCH_NVK_ROOT}/lib/libvulkan.a"
